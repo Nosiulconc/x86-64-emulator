@@ -1,6 +1,12 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <ncurses.h>
+
+static void panic(const char* msg) {
+  printf("ERROR: %s\n", msg);
+  exit(1);
+}
 
 // ******************* //
 // **   EMULATION   ** //
@@ -46,37 +52,150 @@ x64_CPU;
 
 x64_CPU cpu;
 
-static void init_cpu() {
+#define RAM_CAPACITY   32000000 // 512 Mb
+#define DISK_CAPACITY  32000000 //  32 Mb
 
+uint8_t* ram;
+uint8_t* disk;
+
+static void init_ram(void) {
+  if( (ram = malloc(RAM_CAPACITY)) == NULL )
+    panic("RAM memory couldn't be allocated!");
+}
+
+static void init_disk(void) {
+  if( (disk = malloc(DISK_CAPACITY)) == NULL )
+    panic("Disk memory couldn't be allocated!");
+}
+
+static uint64_t load_file_into_disk(const char* path, uint8_t* buffer) {
+  FILE* file;
+  if( (file = fopen(path, "rb")) == NULL )
+    panic("Couldn't open the file!");
+
+  if( fseek(file, 0, SEEK_END) < 0 ) {
+    puts("ERROR: Couldn't reach the end of the file!");
+    goto close_file_then_exit;
+  }
+  int64_t file_size;
+  if( (file_size = ftell(file)) == -1 ) {
+    puts("ERROR: Couldn't get the file size!");
+    goto close_file_then_exit;
+  }
+  if( fseek(file, 0, SEEK_SET) < 0 ) {
+    puts("ERROR: Couldn't reach the start of the file!");
+    goto close_file_then_exit;
+  }
+  
+  if( !fread(buffer, file_size, 1, file) ) {
+    puts("ERROR: Couldn't read the file!");
+    goto close_file_then_exit;
+  }
+
+  if( fclose(file) == EOF )
+    panic("Couldn't close the file!");
+
+  return file_size;
+
+close_file_then_exit:
+  if( fclose(file) == EOF )
+    panic("Couldn't close the file!");
+  exit(1);
+}
+
+static void load_bootloader_into_ram(void) {
+  // loosely following the EL TORITO specification
+
+  uint32_t default_entry_ptr = (*(uint32_t*)(disk + 0x8847)) * 2048 + 32;
+    
+  if( disk[default_entry_ptr] == 0 )
+    panic("Default entry is marked as not bootable!");
+
+  if( disk[default_entry_ptr + 1] != 0 )
+    panic("Can only handle \"no emulation\" boot media type!");
+
+  uint16_t load_segment = *(uint16_t*)(disk + default_entry_ptr + 2);
+  if( load_segment == 0 )
+    load_segment = 0x7C0;
+
+  uint16_t sector_count   = *(uint16_t*)(disk + default_entry_ptr + 6);
+  uint32_t bootloader_ptr = (*(uint32_t*)(disk + default_entry_ptr + 8)) * 2048;
+
+  if( load_segment * 16 + sector_count * 2048 > RAM_CAPACITY )
+    panic("Not enought RAM to load the bootloader!");
+
+  memcpy(ram + load_segment * 16, disk + bootloader_ptr, sector_count * 2048);
+}
+
+static void init_cpu(void) {
+  cpu.rflags     = 0x2;
+  
+  cpu.rip        = 0x7C00;
+  
+  cpu.cr0        = 0x60000010;
+  cpu.cr2        = 0x0;
+  cpu.cr3        = 0x0;
+  cpu.cr4        = 0x0;
+  
+  cpu.cs         = 0x0;
+  cpu.ss         = 0x0;
+  cpu.ds         = 0x0;
+  cpu.es         = 0x0;
+  cpu.fs         = 0x0;
+  cpu.gs         = 0x0;
+
+  cpu.rdx        = 0x0; // cleared: model info is not used anyways
+  cpu.rax        = 0x0; // BIST successful
+  cpu.rbx        = 0x0;
+  cpu.rcx        = 0x0;
+  cpu.rsi        = 0x0;
+  cpu.rdi        = 0x0;
+  cpu.rbp        = 0x0;
+  cpu.rsp        = 0x0;
+
+  cpu.gdtr.base  = 0x0;
+  cpu.gdtr.limit = 0xFFFF;
+  cpu.idtr.base  = 0x0;
+  cpu.idtr.limit = 0xFFFF;
+
+  cpu.ldtr       = 0x0;
+  cpu.tr         = 0x0;
+
+  cpu.r8         = 0x0;
+  cpu.r9         = 0x0;
+  cpu.r10        = 0x0;
+  cpu.r11        = 0x0;
+  cpu.r12        = 0x0;
+  cpu.r13        = 0x0;
+  cpu.r14        = 0x0;
+  cpu.r15        = 0x0;
+
+  cpu.IA32_EFER  = 0x0;
 }
 
 // ************ //
 // **   UI   ** //
 // ************ //
 
-static void panic(const char* msg) {
-  printf("ERROR: %s", msg); exit(1);
-}
-
 static void draw_bytes(WINDOW* win, uint8_t* bytes, uint64_t addr) {
   for(int32_t i = 0; i < 16; ++i) {
     mvwprintw(win, i + 1, 1, "%015lx: ", addr);
     addr += 16;
     for(int32_t j = 0; j < 16; ++j) {
-      mvwprintw(win, i + 1, j*3 + 1 + 17, "%02hhx", *bytes);
+      mvwprintw(win, i + 1, j*3 + 18, "%02hhx", *bytes);
       
       const char c = ( (*bytes) >= 0x20 && (*bytes) <= 0x7E ) ? (*bytes) : '.';
-      mvwprintw(win, i + 1, 16 + 1 + 16*2 + 17 + j, "%c", c);
+      mvwprintw(win, i + 1, j + 66, "%c", c);
       
       ++bytes;
     }
   }
 }
 
-static void draw_win(WINDOW* win, uint8_t* bytes, uint8_t* base_addr) {
+static void draw_hexwin(WINDOW* win, int32_t width, int32_t height, uint8_t* bytes, uint8_t* addr) {
   box(win, 0, 0);
-  for(int32_t i = 1; i < 82; ++i) mvwprintw(win, 1 + 16, i, "-");
-  draw_bytes(win, base_addr, base_addr - bytes);
+  for(int32_t i = 1; i < width - 1; ++i) mvwprintw(win, height - 3, i, "-");
+  draw_bytes(win, addr, addr - bytes);
 }
 
 static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
@@ -111,28 +230,31 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 18, 1, "r14: %08lx.%04x.%02x.%02hhx", cpu.r14>>32, cpu.r14d>>16, cpu.r14w>>8, cpu.r14b);
   mvwprintw(win, 19, 1, "r15: %08lx.%04x.%02x.%02hhx", cpu.r15>>32, cpu.r15d>>16, cpu.r15w>>8, cpu.r15b);
 
-  mvwprintw(win, 1, 1 + 23 + 3, "cs  : %04x", cpu.cs);
-  mvwprintw(win, 2, 1 + 23 + 3, "ss  : %04x", cpu.ss);
-  mvwprintw(win, 3, 1 + 23 + 3, "ds  : %04x", cpu.ds);
-  mvwprintw(win, 4, 1 + 23 + 3, "es  : %04x", cpu.es);
-  mvwprintw(win, 5, 1 + 23 + 3, "fs  : %04x", cpu.fs);
-  mvwprintw(win, 6, 1 + 23 + 3, "gs  : %04x", cpu.gs);
+  mvwprintw(win, 1, 27, "cs  : %04x", cpu.cs);
+  mvwprintw(win, 2, 27, "ss  : %04x", cpu.ss);
+  mvwprintw(win, 3, 27, "ds  : %04x", cpu.ds);
+  mvwprintw(win, 4, 27, "es  : %04x", cpu.es);
+  mvwprintw(win, 5, 27, "fs  : %04x", cpu.fs);
+  mvwprintw(win, 6, 27, "gs  : %04x", cpu.gs);
 
-  mvwprintw(win, 1, 26 + 10 + 3, "rip: %016lx", cpu.rip);
+  mvwprintw(win, 1, 39, "rip: %016lx", cpu.rip);
 }
 
 int32_t main(void) {
+  init_ram();
+  init_disk();
+  init_cpu();
+
+  const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
+  load_bootloader_into_ram();
+
+  uint8_t* hex_addr = ram;
+  uint8_t* hex_base_addr = ram;
+  uint64_t hex_buffer_size = RAM_CAPACITY;
+
   WINDOW* stdwin;
-
-  if( (stdwin = initscr()) == NULL ) panic("Failed to initialize ncurses!");
-  if( has_colors() == FALSE ) {
-    endwin();
-    panic("No support for colors!");
-  }
-
-  //start_color();
-  //init_pair(0, COLOR_WHITE, COLOR_MAGENTA);
-  //attron(COLOR_PAIR(0));
+  if( (stdwin = initscr()) == NULL )
+    panic("Failed to initialize ncurses!");
 
   cbreak();
   noecho();
@@ -140,30 +262,27 @@ int32_t main(void) {
   curs_set(FALSE);
 
   // hex viewer
-  const int32_t width  = 16 + 1 + 16*2 + 17 + 1 + 16;
-  const int32_t height = 16 + 2 + 2;
-  WINDOW* win = newwin(height, width, 0, 0);
+  const int32_t hex_width  = 83;
+  const int32_t hex_height = 20;
+  WINDOW* hexwin = newwin(hex_height, hex_width, 0, 0);
   wrefresh(stdwin);
-  
-  uint8_t bytes[512] = "Hello, world!";
-  uint8_t* base_addr = bytes;
 
-  draw_win(win, bytes, base_addr);
-  wrefresh(win);
+  draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+  wrefresh(hexwin);
 
   // controls
-  const int32_t ctrl_width  = 17 + 2;
-  const int32_t ctrl_height = 19 + 2;
-  WINDOW* ctrlwin = newwin(ctrl_height, ctrl_width, height, width - ctrl_width);
+  const int32_t ctrl_width  = 19;
+  const int32_t ctrl_height = 21;
+  WINDOW* ctrlwin = newwin(ctrl_height, ctrl_width, hex_height, hex_width - ctrl_width);
   wrefresh(stdwin);
 
   draw_ctrlwin(ctrlwin, ctrl_width, ctrl_height);
   wrefresh(ctrlwin);
 
   // registers
-  const int32_t reg_width  = width - ctrl_width;
+  const int32_t reg_width  = hex_width - ctrl_width;
   const int32_t reg_height = ctrl_height;
-  WINDOW* regwin = newwin(reg_height, reg_width, height, 0);
+  WINDOW* regwin = newwin(reg_height, reg_width, hex_height, 0);
   wrefresh(stdwin);
 
   draw_regwin(regwin, reg_width, reg_height);
@@ -172,41 +291,51 @@ int32_t main(void) {
   int32_t c;
   while( (c = wgetch(stdwin)) != 'q' ) {
     switch( c ) {
-      case KEY_UP:   if( base_addr > bytes ) base_addr -= 16; break;
-      case KEY_DOWN: if( base_addr + 256 < bytes + 512 ) base_addr += 16; break;
+      case KEY_UP: {
+        if( hex_addr > hex_base_addr )
+          hex_addr -= 16;
+          draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+          wrefresh(hexwin);
+        break;
+      }
+      case KEY_DOWN: {
+        if( hex_addr + 256 < hex_base_addr + hex_buffer_size )
+          hex_addr += 16;
+          draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+          wrefresh(hexwin);
+        break;
+      }
       case 'g': {
-        wmove(win, 16 + 2, 1);
+        wmove(hexwin, hex_height - 2, 1);
         
         curs_set(TRUE);
         echo();
 
-        char buff[81];
-        wgetnstr(win, buff, 81);
+        char buff[hex_width - 2];
+        wgetnstr(hexwin, buff, hex_width - 2);
         
         noecho();
         curs_set(FALSE);
 
         uint64_t seg;
-        if( sscanf(buff, "%lx", &seg) < 1 ) goto redraw;
+        if( (sscanf(buff, "%lx", &seg) < 1) || (seg < 0) ) {
+          werase(hexwin);
+          draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+          wrefresh(hexwin);
+          break;
+        }
 
-        if( seg % 16 ) goto redraw;
-        if( seg < 0 ) goto redraw;
-        if( seg + 256 > 512 ) seg = 512 - 256;
+        seg = (seg >> 4) << 4;
+        if( seg + 256 > hex_buffer_size )
+          seg = hex_buffer_size - 256;
 
-        base_addr = bytes + seg;
-      
-      redraw:
-        werase(win);
-        draw_win(win, bytes, base_addr);
-        wrefresh(win);
+        hex_addr = hex_base_addr + seg;
+        werase(hexwin);
+        draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+        wrefresh(hexwin);
+        break;
       }
     }
-
-    //werase(stdwin);
-    //wrefresh(stdwin);
-
-    draw_win(win, bytes, base_addr);
-    wrefresh(win);
   }
 
   endwin();
