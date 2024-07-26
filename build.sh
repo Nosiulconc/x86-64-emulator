@@ -1,3 +1,3 @@
-gcc -o emu emu.c -lncurses
+gcc -Wall -Wextra -std="c11" -o x64_emu ./src/main.c -lncurses
 read -p "Press any key to execute..."
-./emu
+./x64_emu
