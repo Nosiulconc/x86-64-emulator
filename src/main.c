@@ -8,6 +8,7 @@
 #include "inst_decoder.h"
 
 void panic(const char* msg) {
+  endwin();
   printf("ERROR: %s\n", msg);
   exit(1);
 }
@@ -17,6 +18,7 @@ void panic(const char* msg) {
 // ******************* // 
 
 x64_CPU cpu;
+OperationMode op_mode;
 
 #define RAM_CAPACITY   32000000 // 512 Mb
 #define DISK_CAPACITY  32000000 //  32 Mb
@@ -66,6 +68,7 @@ static uint64_t load_file_into_disk(const char* path, uint8_t* buffer) {
 close_file_then_exit:
   if( fclose(file) == EOF )
     panic("Couldn't close the file!");
+  endwin();
   exit(1);
 }
 
@@ -93,62 +96,21 @@ static void load_bootloader_into_ram(void) {
   memcpy(ram + load_segment * 16, disk + bootloader_ptr, sector_count * 2048);
 }
 
-static void init_cpu(void) {
-  cpu.rflags     = 0x2;
-  
-  cpu.rip        = 0x7C00;
-  
-  cpu.cr0        = 0x60000010;
-  cpu.cr2        = 0x0;
-  cpu.cr3        = 0x0;
-  cpu.cr4        = 0x0;
-  
-  cpu.cs         = 0x0;
-  cpu.ss         = 0x0;
-  cpu.ds         = 0x0;
-  cpu.es         = 0x0;
-  cpu.fs         = 0x0;
-  cpu.gs         = 0x0;
-
-  cpu.rdx        = 0x0; // cleared: model info is not used anyways
-  cpu.rax        = 0x0; // BIST successful
-  cpu.rbx        = 0x0;
-  cpu.rcx        = 0x0;
-  cpu.rsi        = 0x0;
-  cpu.rdi        = 0x0;
-  cpu.rbp        = 0x0;
-  cpu.rsp        = 0x0;
-
-  cpu.gdtr.base  = 0x0;
-  cpu.gdtr.limit = 0xFFFF;
-  cpu.idtr.base  = 0x0;
-  cpu.idtr.limit = 0xFFFF;
-
-  cpu.ldtr       = 0x0;
-  cpu.tr         = 0x0;
-
-  cpu.r8         = 0x0;
-  cpu.r9         = 0x0;
-  cpu.r10        = 0x0;
-  cpu.r11        = 0x0;
-  cpu.r12        = 0x0;
-  cpu.r13        = 0x0;
-  cpu.r14        = 0x0;
-  cpu.r15        = 0x0;
-
-  cpu.IA32_EFER  = 0x0;
-}
-
 // ************ //
 // **   UI   ** //
 // ************ //
 
-static void draw_bytes(WINDOW* win, uint8_t* bytes, uint64_t addr) {
+char assembly[22] = "none";
+
+static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
+  const uint8_t* rip = base_addr + get_flat_address(cpu.cs, cpu.rip);
   for(int32_t i = 0; i < 16; ++i) {
-    mvwprintw(win, i + 1, 1, "%015lx: ", addr);
-    addr += 16;
+    mvwprintw(win, i + 1, 1, "%015lx: ", rel_addr);
+    rel_addr += 16;
     for(int32_t j = 0; j < 16; ++j) {
+      if( bytes == rip ) wattron(win, A_REVERSE);
       mvwprintw(win, i + 1, j*3 + 18, "%02hhx", *bytes);
+      if( bytes == rip ) wattroff(win, A_REVERSE);
       
       const char c = ( (*bytes) >= 0x20 && (*bytes) <= 0x7E ) ? (*bytes) : '.';
       mvwprintw(win, i + 1, j + 66, "%c", c);
@@ -158,10 +120,10 @@ static void draw_bytes(WINDOW* win, uint8_t* bytes, uint64_t addr) {
   }
 }
 
-static void draw_hexwin(WINDOW* win, int32_t width, int32_t height, uint8_t* bytes, uint8_t* addr) {
+static void draw_hexwin(WINDOW* win, int32_t width, int32_t height, uint8_t* base_addr, uint8_t* bytes) {
   box(win, 0, 0);
   for(int32_t i = 1; i < width - 1; ++i) mvwprintw(win, height - 3, i, "-");
-  draw_bytes(win, addr, addr - bytes);
+  draw_bytes(win, base_addr, bytes, bytes - base_addr);
 }
 
 static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
@@ -171,6 +133,8 @@ static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 4, 2, "up: scroll down");
   mvwprintw(win, 5, 2, "down: scroll up");
   mvwprintw(win, 6, 2, "g: goto segment");
+  mvwprintw(win, 7, 2, "j: jump to rip");
+  mvwprintw(win, 8, 2, "e: execute/step");
 }
 
 static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
@@ -203,13 +167,23 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 5, 27, "fs  : %04x", cpu.fs);
   mvwprintw(win, 6, 27, "gs  : %04x", cpu.gs);
 
+  mvwprintw(win, 8, 27, "RFLAGS");
+  mvwprintw(win, 9, 27, "DF:%lu", (cpu.rflags & RFLAGS_DF) / RFLAGS_DF);
+
+  mvwprintw(win, 8, 34, "CR0");
+  mvwprintw(win, 9, 34, "PE:%lu", (cpu.cr0 & CR0_PE) / CR0_PE);
+
+  wattron(win, A_REVERSE);
   mvwprintw(win, 1, 39, "rip: %016lx", cpu.rip);
+  mvwprintw(win, 4, 39, "%s", assembly);
+  wattroff(win, A_REVERSE);
 }
 
 int32_t main(void) {
   init_ram();
   init_disk();
   init_cpu();
+  op_mode = get_cpu_operation_mode();
 
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
   load_bootloader_into_ram();
@@ -301,6 +275,25 @@ int32_t main(void) {
         werase(hexwin);
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
         wrefresh(hexwin);
+        break;
+      }
+      case 'j': {
+        uint64_t seg = (get_flat_address(cpu.cs, cpu.rip) >> 4) << 4;
+        hex_addr = hex_base_addr + seg;
+
+        draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+        wrefresh(hexwin);
+        break;
+      }
+      case 'e': {
+        Exception excep = { 0 };
+        cpu.rip = decode_instruction(EXECUTE_DISASSEMBLE, assembly, sizeof(assembly) - 1, &excep); 
+        
+        draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+        wrefresh(hexwin);
+        werase(regwin);
+        draw_regwin(regwin, reg_width, reg_height);
+        wrefresh(regwin);
         break;
       }
     }
