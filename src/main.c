@@ -6,6 +6,7 @@
 
 #include "x64_cpu.h"
 #include "inst_decoder.h"
+#include "string_struct.h"
 
 void panic(const char* msg) {
   endwin();
@@ -100,7 +101,8 @@ static void load_bootloader_into_ram(void) {
 // **   UI   ** //
 // ************ //
 
-char assembly[22] = "none";
+char str[22] = "none";
+String assembly = { 21, str };
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
   const uint8_t* rip = base_addr + get_flat_address(cpu.cs, cpu.rip);
@@ -167,15 +169,16 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 5, 27, "fs  : %04x", cpu.fs);
   mvwprintw(win, 6, 27, "gs  : %04x", cpu.gs);
 
-  mvwprintw(win, 8, 27, "RFLAGS");
-  mvwprintw(win, 9, 27, "DF:%lu", (cpu.rflags & RFLAGS_DF) / RFLAGS_DF);
+  mvwprintw(win, 8,  27, "RFLAGS");
+  mvwprintw(win, 9,  27, "IF:%lu", (cpu.rflags & RFLAGS_IF) / RFLAGS_IF);
+  mvwprintw(win, 10, 27, "DF:%lu", (cpu.rflags & RFLAGS_DF) / RFLAGS_DF);
 
   mvwprintw(win, 8, 34, "CR0");
   mvwprintw(win, 9, 34, "PE:%lu", (cpu.cr0 & CR0_PE) / CR0_PE);
 
   wattron(win, A_REVERSE);
   mvwprintw(win, 1, 39, "rip: %016lx", cpu.rip);
-  mvwprintw(win, 4, 39, "%s", assembly);
+  mvwprintw(win, 4, 39, "%s", assembly.str);
   wattroff(win, A_REVERSE);
 }
 
@@ -286,8 +289,7 @@ int32_t main(void) {
         break;
       }
       case 'e': {
-        Exception excep = { 0 };
-        cpu.rip = decode_instruction(EXECUTE_DISASSEMBLE, assembly, sizeof(assembly) - 1, &excep); 
+        cpu.rip = decode_instruction(EXECUTE_DISASSEMBLE, assembly); 
         
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
         wrefresh(hexwin);
