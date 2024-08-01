@@ -105,6 +105,15 @@ void init_cpu(void) {
 uint64_t get_flat_address(uint64_t segment, uint64_t offset) {
   switch( op_mode ) {
     case REAL_MODE: return (segment << 4) + offset;
+    default:        panic("Flat address for 32, 64 bit modes isn't implemented!");
+  }
+}
+
+uint64_t get_ip(void) {
+  switch( op_mode ) {
+    case REAL_MODE:      return cpu.ip;
+    case PROTECTED_MODE: return cpu.eip;
+    case LONG_MODE:      return cpu.rip;
   }
 }
 

@@ -105,7 +105,7 @@ char str[22] = "none";
 String assembly = { 21, str };
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
-  const uint8_t* rip = base_addr + get_flat_address(cpu.cs, cpu.rip);
+  const uint8_t* rip = base_addr + get_flat_address(cpu.cs, get_ip());
   for(int32_t i = 0; i < 16; ++i) {
     mvwprintw(win, i + 1, 1, "%015lx: ", rel_addr);
     rel_addr += 16;
@@ -281,7 +281,7 @@ int32_t main(void) {
         break;
       }
       case 'j': {
-        uint64_t seg = (get_flat_address(cpu.cs, cpu.rip) >> 4) << 4;
+        uint64_t seg = (get_flat_address(cpu.cs, get_ip()) >> 4) << 4;
         hex_addr = hex_base_addr + seg;
 
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);

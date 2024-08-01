@@ -75,6 +75,22 @@ static uint8_t* check_rex_prefix(uint8_t* rip) {
   return rip + 1;
 }
 
+uint64_t get_operand_sz_ip(uint8_t operand_sz) {
+  switch( operand_sz ) {
+    case 2: return cpu.ip;
+    case 4: return cpu.eip;
+    case 8: return cpu.rip;
+  }
+}
+
+static uint64_t get_sp(void) {
+  switch( op_mode ) {
+    case REAL_MODE:      return cpu.sp;
+    case PROTECTED_MODE: panic("get_sp for 32 bit mode isn't implemented!");
+    case LONG_MODE:      return cpu.rsp;
+  }
+}
+
 static uint8_t not_rex_ext_operand_sz(void) {
   switch( op_mode ) {
     case REAL_MODE:      return prefixes.g3.present ? 4 : 2;
@@ -242,7 +258,7 @@ typedef enum { INDIRECT = 0, DIRECT = 1 } AddressingMode;
 typedef struct {
   uint8_t reg;
   AddressingMode mode;
-  uint64_t val;
+  union { uint64_t flat_addr; uint8_t* reg_addr };
 }
 ModRM_Info;
 
@@ -279,7 +295,7 @@ static uint8_t* read_modrm(DecodeMode mode, uint8_t* rip, uint8_t operand_sz, ui
             if( mode & EXECUTE_ONLY ) {
               if( !segment_override ) segment = cpu.ds;
               info->mode = INDIRECT;
-              info->val = get_flat_address(segment, imm);
+              info->flat_addr = get_flat_address(segment, imm);
             }
             return rip + 3;
           }
@@ -288,7 +304,7 @@ static uint8_t* read_modrm(DecodeMode mode, uint8_t* rip, uint8_t operand_sz, ui
           if( mode & EXECUTE_ONLY ) {
             if( !segment_override ) segment = real_mode_addr_default_segment(rm);
             info->mode = INDIRECT;
-            info->val = get_flat_address(segment, real_mode_addr_calc(rm));
+            info->flat_addr = get_flat_address(segment, real_mode_addr_calc(rm));
           }
           return rip + 1;
         }
@@ -299,7 +315,7 @@ static uint8_t* read_modrm(DecodeMode mode, uint8_t* rip, uint8_t operand_sz, ui
           if( mod & EXECUTE_ONLY ) {
             if( !segment_override ) segment = real_mode_addr_default_segment(rm);
             info->mode = INDIRECT;
-            info->val = get_flat_address(segment, real_mode_addr_calc(rm) + disp);
+            info->flat_addr = get_flat_address(segment, real_mode_addr_calc(rm) + disp);
           }
           return rip + 2;
         }
@@ -310,7 +326,7 @@ static uint8_t* read_modrm(DecodeMode mode, uint8_t* rip, uint8_t operand_sz, ui
           if( mode & EXECUTE_ONLY ) {
             if( !segment_override ) segment = real_mode_addr_default_segment(rm);
             info->mode = INDIRECT;
-            info->val = get_flat_address(segment, real_mode_addr_calc(rm) + disp);
+            info->flat_addr = get_flat_address(segment, real_mode_addr_calc(rm) + disp);
           }
           return rip + 3;
         }
@@ -319,17 +335,17 @@ static uint8_t* read_modrm(DecodeMode mode, uint8_t* rip, uint8_t operand_sz, ui
           switch( operand_sz ) {
             case 1: {
               if( mode & DISASSEMBLE_ONLY ) snprintf(str, len, "%s", byte_reg_str[rm]);
-              if( mode & EXECUTE_ONLY )     info->val = *(uint8_t*)(byte_reg_addr[rm]);
+              if( mode & EXECUTE_ONLY )     info->reg_addr = byte_reg_addr[rm];
               return rip + 1;
             }
             case 2: {
               if( mode & DISASSEMBLE_ONLY ) snprintf(str, len, "%s", word_reg_str[rm]);
-              if( mode & EXECUTE_ONLY )     info->val = *(uint16_t*)(word_reg_addr[rm]);
+              if( mode & EXECUTE_ONLY )     info->reg_addr = word_reg_addr[rm];
               return rip + 1;
             }
             case 4: {
               if( mode & DISASSEMBLE_ONLY ) snprintf(str, len, "%s", dword_reg_str[rm]);
-              if( mode & EXECUTE_ONLY )     info->val = *(uint32_t*)(dword_reg_addr[rm]);
+              if( mode & EXECUTE_ONLY )     info->reg_addr = dword_reg_addr[rm];
               return rip + 1;
             }
           }
@@ -459,10 +475,34 @@ static uint8_t* decode_one_byte_opcode(DecodeMode mode, uint8_t* rip, String ass
       if( mode & DISASSEMBLE_ONLY )
         snprintf(str, len, "POP  %s", get_reg_string(opcode_reg, operand_sz));
       if( mode & EXECUTE_ONLY ) {
-        memcpy(get_reg_addr(opcode_reg, operand_sz), ram + get_flat_address(cpu.ss, cpu.rsp), operand_sz);
+        memcpy(get_reg_addr(opcode_reg, operand_sz), ram + get_flat_address(cpu.ss, get_sp()), operand_sz);
         cpu.rsp += operand_sz;
       }
       return rip + 1;
+    }
+    case 0x83: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
+      const uint8_t* post_modrm = read_modrm(mode, rip+1, operand_sz, address_sz(), modrm, &info);
+
+      switch( info.reg ) {
+        case 5: {
+          const int64_t imm = read_displacement(post_modrm, 1);
+          if( mode & DISASSEMBLE_ONLY )
+            snprintf(str, len, "SUB  %s, %c0x%lx", modrm.str, pos_neg[imm<0], ABS(imm));
+          if( mode & EXECUTE_ONLY ) {
+            if( info.mode == INDIRECT ) {
+              const int64_t calc = read_displacement(ram + info.flat_addr, operand_sz) - imm;
+              memcpy(ram + info.flat_addr, &calc, operand_sz);
+            }
+            if( info.mode == DIRECT ) {
+              const int64_t calc = read_displacement(info.reg_addr, operand_sz) - imm;
+              memcpy(info.reg_addr, &calc, operand_sz);
+            }
+          }
+          return post_modrm + 1;
+        }
+      }
     }
     case 0x8E: {
       char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
@@ -472,8 +512,8 @@ static uint8_t* decode_one_byte_opcode(DecodeMode mode, uint8_t* rip, String ass
         snprintf(str, len, "MOV  %s, %s", seg_reg_str[info.reg], modrm.str);
       if( mode & EXECUTE_ONLY ) {
         uint16_t* seg_reg = seg_reg_addr[info.reg];
-        if( info.mode == INDIRECT ) memcpy(seg_reg, ram + info.val, 2);
-        if( info.mode == DIRECT )   *seg_reg = (uint16_t)info.val;
+        if( info.mode == INDIRECT ) memcpy(seg_reg, ram + info.flat_addr, 2);
+        if( info.mode == DIRECT )   *seg_reg = *(uint16_t*)(info.reg_addr);
       }
       return next_inst;
     }
@@ -494,6 +534,9 @@ static uint8_t* decode_one_byte_opcode(DecodeMode mode, uint8_t* rip, String ass
         memcpy(get_reg_addr(opcode_reg, operand_sz), rip+1, operand_sz);
       return rip + 1 + operand_sz;
     }
+    case 0xC1: {
+      // TODO implement SHR
+    }
     case 0xE8: {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
       const uint8_t disp_sz    = MIN(operand_sz, 4);
@@ -503,9 +546,9 @@ static uint8_t* decode_one_byte_opcode(DecodeMode mode, uint8_t* rip, String ass
         next = rip + 1 + disp_sz;
       }
       if( mode & EXECUTE_ONLY ) {
-        uint64_t n_rip = cpu.rip + 1 + disp_sz;
+        uint64_t n_rip = get_operand_sz_ip(operand_sz) + 1 + disp_sz;
         cpu.rsp -= operand_sz;
-        memcpy(ram + get_flat_address(cpu.ss, cpu.rsp), &n_rip, operand_sz);
+        memcpy(ram + get_flat_address(cpu.ss, get_sp()), &n_rip, operand_sz);
         next = rip + 1 + disp_sz + disp;
       }
       return next;
@@ -550,7 +593,7 @@ static uint8_t* read_and_decode_opcode(DecodeMode mode, uint8_t* rip, String ass
 uint64_t decode_instruction(DecodeMode mode, String assembly) {
   op_mode = get_cpu_operation_mode();
   
-  const uint8_t* rip_base = ram + get_flat_address(cpu.cs, cpu.rip);
+  const uint8_t* rip_base = ram + get_flat_address(cpu.cs, get_ip());
   uint8_t*            rip = rip_base;
 
   prefixes = (InstructionPrefixes){ 0 };
@@ -560,7 +603,7 @@ uint64_t decode_instruction(DecodeMode mode, String assembly) {
     rip = check_rex_prefix(rip);
   
   rip = read_and_decode_opcode(mode, rip, assembly);
-  return cpu.rip + (rip - rip_base);
+  return get_ip() + (rip - rip_base);
 }
 
 #endif
