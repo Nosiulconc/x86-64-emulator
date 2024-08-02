@@ -487,18 +487,41 @@ static uint8_t* decode_one_byte_opcode(DecodeMode mode, uint8_t* rip, String ass
 
       switch( info.reg ) {
         case 5: {
-          const int64_t imm = read_displacement(post_modrm, 1);
+          int64_t a, c;
+          int64_t b = read_displacement(post_modrm, 1);
           if( mode & DISASSEMBLE_ONLY )
-            snprintf(str, len, "SUB  %s, %c0x%lx", modrm.str, pos_neg[imm<0], ABS(imm));
+            snprintf(str, len, "SUB  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
           if( mode & EXECUTE_ONLY ) {
             if( info.mode == INDIRECT ) {
-              const int64_t calc = read_displacement(ram + info.flat_addr, operand_sz) - imm;
-              memcpy(ram + info.flat_addr, &calc, operand_sz);
+              a = read_displacement(ram + info.flat_addr, operand_sz);
+              c = a - b;
+              memcpy(ram + info.flat_addr, &c, operand_sz);
             }
             if( info.mode == DIRECT ) {
-              const int64_t calc = read_displacement(info.reg_addr, operand_sz) - imm;
-              memcpy(info.reg_addr, &calc, operand_sz);
+              a = read_displacement(info.reg_addr, operand_sz);
+              c = a - b;
+              memcpy(info.reg_addr, &c, operand_sz);
             }
+            // OF
+            const uint8_t s_a = a < 0, s_b = b < 0, s_c = c < 0;
+            if( (s_a == 0 && s_b == 0) || (s_a == 1 && s_b == 1) ) cpu.rflags &= ~(RFLAGS_OF); 
+            if( s_a == 0 && s_b == 1 ) {
+              if( s_c ) { cpu.rflags |= RFLAGS_OF; } else { cpu.rflags &= ~(RFLAGS_OF); }
+            }
+            if( s_a == 1 && s_b == 0 ) {
+              if( !s_c ) { cpu.rflags |= RFLAGS_OF; } else { cpu.rflags &= ~(RFLAGS_OF); }
+            }
+            // SF
+            if( s_c ) { cpu.rflags |= RFLAGS_SF; } else { cpu.rflags &= ~(RFLAGS_SF); }
+            // ZF
+            if( c == 0 ) { cpu.rflags |= RFLAGS_ZF; } else { cpu.rflags &= ~(RFLAGS_ZF); }
+            // AF
+            // PF
+            uint8_t n = 0;
+            for(uint8_t mask = 1; mask <= 128; mask *= 2)
+              if( c & mask ) ++n;
+            if( n % 2 ) { cpu.rflags &= ~(RFLAGS_ZF); } else { cpu.rflags |= RFLAGS_ZF; }
+            // CF
           }
           return post_modrm + 1;
         }

@@ -41,8 +41,14 @@ typedef struct {
 }
 x64_CPU;
 
+#define RFLAGS_CF (uint64_t)(1 <<  0)
+#define RFLAGS_PF (uint64_t)(1 <<  2)
+#define RFLAGS_AF (uint64_t)(1 <<  4)
+#define RFLAGS_ZF (uint64_t)(1 <<  6)
+#define RFLAGS_SF (uint64_t)(1 <<  7)
 #define RFLAGS_IF (uint64_t)(1 <<  9)
 #define RFLAGS_DF (uint64_t)(1 << 10)
+#define RFLAGS_OF (uint64_t)(1 << 11)
 
 #define CR0_PE (uint64_t)(1 << 0) // 0 = 16-bit real mode, 1 = 32-bit protected mode
 
