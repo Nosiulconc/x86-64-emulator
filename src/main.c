@@ -170,8 +170,14 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 6, 27, "gs  : %04x", cpu.gs);
 
   mvwprintw(win, 8,  27, "RFLAGS");
-  mvwprintw(win, 9,  27, "IF:%lu", (cpu.rflags & RFLAGS_IF) / RFLAGS_IF);
-  mvwprintw(win, 10, 27, "DF:%lu", (cpu.rflags & RFLAGS_DF) / RFLAGS_DF);
+  mvwprintw(win, 9,  27, "CF:%lu", (cpu.rflags & RFLAGS_CF) / RFLAGS_CF);
+  mvwprintw(win, 10, 27, "PF:%lu", (cpu.rflags & RFLAGS_PF) / RFLAGS_PF);
+  mvwprintw(win, 11, 27, "AF:%lu", (cpu.rflags & RFLAGS_AF) / RFLAGS_AF);
+  mvwprintw(win, 12, 27, "ZF:%lu", (cpu.rflags & RFLAGS_ZF) / RFLAGS_ZF);
+  mvwprintw(win, 13, 27, "SF:%lu", (cpu.rflags & RFLAGS_SF) / RFLAGS_SF);
+  mvwprintw(win, 14, 27, "IF:%lu", (cpu.rflags & RFLAGS_IF) / RFLAGS_IF);
+  mvwprintw(win, 15, 27, "DF:%lu", (cpu.rflags & RFLAGS_DF) / RFLAGS_DF);
+  mvwprintw(win, 16, 27, "OF:%lu", (cpu.rflags & RFLAGS_OF) / RFLAGS_OF);
 
   mvwprintw(win, 8, 34, "CR0");
   mvwprintw(win, 9, 34, "PE:%lu", (cpu.cr0 & CR0_PE) / CR0_PE);
