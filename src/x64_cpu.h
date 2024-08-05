@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+extern void panic(const char* msg);
+
 typedef enum { REAL_MODE, PROTECTED_MODE, LONG_MODE } OperationMode;
 
 typedef struct {

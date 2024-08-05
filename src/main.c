@@ -20,6 +20,7 @@ void panic(const char* msg) {
 
 x64_CPU cpu;
 OperationMode op_mode;
+uint64_t inst_counter;
 
 #define RAM_CAPACITY   32000000 // 512 Mb
 #define DISK_CAPACITY  32000000 //  32 Mb
@@ -73,6 +74,40 @@ close_file_then_exit:
   exit(1);
 }
 
+static void load_inst_counter_from_file(const char* path) {
+  FILE* file;
+  if( (file = fopen(path, "r")) == NULL )
+    panic("Couldn't open the file!");
+
+  if( fscanf(file, "%ld", &inst_counter) < 1 ) {
+    puts("Couldn't parse inst_counter!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  if( fclose(file) == EOF )
+    panic("Couldn't close the file!");
+}
+
+static void save_inst_counter_to_file(const char* path) {
+  FILE* file;
+  if( (file = fopen(path, "w")) == NULL )
+    panic("Couldn't open the file!");
+
+  if( fprintf(file, "%ld", inst_counter) == EOF ) {
+    puts("Couldn't save inst_counter!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  if( fclose(file) == EOF )
+    panic("Couldn't close the file!");
+}
+
 static void load_bootloader_into_ram(void) {
   // loosely following the EL TORITO specification
 
@@ -101,8 +136,8 @@ static void load_bootloader_into_ram(void) {
 // **   UI   ** //
 // ************ //
 
-char str[22] = "none";
-String assembly = { 21, str };
+char str[29] = "none";
+String assembly = { 28, str };
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
   const uint8_t* rip = base_addr + get_flat_address(cpu.cs, get_ip());
@@ -137,6 +172,7 @@ static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 6, 2, "g: goto segment");
   mvwprintw(win, 7, 2, "j: jump to rip");
   mvwprintw(win, 8, 2, "e: execute/step");
+  mvwprintw(win, 9, 2, "s: save counter");
 }
 
 static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
@@ -162,29 +198,29 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 18, 1, "r14: %08lx.%04x.%02x.%02hhx", cpu.r14>>32, cpu.r14d>>16, cpu.r14w>>8, cpu.r14b);
   mvwprintw(win, 19, 1, "r15: %08lx.%04x.%02x.%02hhx", cpu.r15>>32, cpu.r15d>>16, cpu.r15w>>8, cpu.r15b);
 
-  mvwprintw(win, 1, 27, "cs  : %04x", cpu.cs);
-  mvwprintw(win, 2, 27, "ss  : %04x", cpu.ss);
-  mvwprintw(win, 3, 27, "ds  : %04x", cpu.ds);
-  mvwprintw(win, 4, 27, "es  : %04x", cpu.es);
-  mvwprintw(win, 5, 27, "fs  : %04x", cpu.fs);
-  mvwprintw(win, 6, 27, "gs  : %04x", cpu.gs);
+  mvwprintw(win, 1, 26, "cs: %04x", cpu.cs);
+  mvwprintw(win, 2, 26, "ss: %04x", cpu.ss);
+  mvwprintw(win, 3, 26, "ds: %04x", cpu.ds);
+  mvwprintw(win, 4, 26, "es: %04x", cpu.es);
+  mvwprintw(win, 5, 26, "fs: %04x", cpu.fs);
+  mvwprintw(win, 6, 26, "gs: %04x", cpu.gs);
 
-  mvwprintw(win, 8,  27, "RFLAGS");
-  mvwprintw(win, 9,  27, "CF:%lu", (cpu.rflags & RFLAGS_CF) / RFLAGS_CF);
-  mvwprintw(win, 10, 27, "PF:%lu", (cpu.rflags & RFLAGS_PF) / RFLAGS_PF);
-  mvwprintw(win, 11, 27, "AF:%lu", (cpu.rflags & RFLAGS_AF) / RFLAGS_AF);
-  mvwprintw(win, 12, 27, "ZF:%lu", (cpu.rflags & RFLAGS_ZF) / RFLAGS_ZF);
-  mvwprintw(win, 13, 27, "SF:%lu", (cpu.rflags & RFLAGS_SF) / RFLAGS_SF);
-  mvwprintw(win, 14, 27, "IF:%lu", (cpu.rflags & RFLAGS_IF) / RFLAGS_IF);
-  mvwprintw(win, 15, 27, "DF:%lu", (cpu.rflags & RFLAGS_DF) / RFLAGS_DF);
-  mvwprintw(win, 16, 27, "OF:%lu", (cpu.rflags & RFLAGS_OF) / RFLAGS_OF);
+  mvwprintw(win, 8,  26, "RFLAGS");
+  mvwprintw(win, 9,  26, "CF:%lu", (cpu.rflags & RFLAGS_CF) / RFLAGS_CF);
+  mvwprintw(win, 10, 26, "PF:%lu", (cpu.rflags & RFLAGS_PF) / RFLAGS_PF);
+  mvwprintw(win, 11, 26, "AF:%lu", (cpu.rflags & RFLAGS_AF) / RFLAGS_AF);
+  mvwprintw(win, 12, 26, "ZF:%lu", (cpu.rflags & RFLAGS_ZF) / RFLAGS_ZF);
+  mvwprintw(win, 13, 26, "SF:%lu", (cpu.rflags & RFLAGS_SF) / RFLAGS_SF);
+  mvwprintw(win, 14, 26, "IF:%lu", (cpu.rflags & RFLAGS_IF) / RFLAGS_IF);
+  mvwprintw(win, 15, 26, "DF:%lu", (cpu.rflags & RFLAGS_DF) / RFLAGS_DF);
+  mvwprintw(win, 16, 26, "OF:%lu", (cpu.rflags & RFLAGS_OF) / RFLAGS_OF);
 
-  mvwprintw(win, 8, 34, "CR0");
-  mvwprintw(win, 9, 34, "PE:%lu", (cpu.cr0 & CR0_PE) / CR0_PE);
+  mvwprintw(win, 8, 33, "CR0");
+  mvwprintw(win, 9, 33, "PE:%lu", (cpu.cr0 & CR0_PE) / CR0_PE);
 
   wattron(win, A_REVERSE);
-  mvwprintw(win, 1, 39, "rip: %016lx", cpu.rip);
-  mvwprintw(win, 4, 39, "%s", assembly.str);
+  mvwprintw(win, 1, 35, "rip: %016lx", cpu.rip);
+  mvwprintw(win, 4, 35, "%s", assembly.str);
   wattroff(win, A_REVERSE);
 }
 
@@ -196,6 +232,10 @@ int32_t main(void) {
 
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
   load_bootloader_into_ram();
+
+  load_inst_counter_from_file("./inst_counter.txt");
+  for(uint64_t i = 0; i < inst_counter; ++i)
+    decode_instruction(assembly);
 
   uint8_t* hex_addr = ram;
   uint8_t* hex_base_addr = ram;
@@ -295,13 +335,18 @@ int32_t main(void) {
         break;
       }
       case 'e': {
-        cpu.rip = decode_instruction(EXECUTE_DISASSEMBLE, assembly); 
+        decode_instruction(assembly);
+        ++inst_counter;
         
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
         wrefresh(hexwin);
         werase(regwin);
         draw_regwin(regwin, reg_width, reg_height);
         wrefresh(regwin);
+        break;
+      }
+      case 's': {
+        save_inst_counter_to_file("./inst_counter.txt");
         break;
       }
     }
