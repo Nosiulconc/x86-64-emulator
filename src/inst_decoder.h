@@ -35,7 +35,8 @@ extern OperationMode op_mode;
 extern x64_CPU cpu;
 extern uint8_t* ram;
 
-extern void panic(const char* msg);
+extern void panic(const char*);
+extern void telwin_output(char);
 
 static uint8_t* ram_addr_ip(void) {
   return ram + get_flat_address(cpu.cs, get_ip());
@@ -83,11 +84,19 @@ static void check_rex_prefix(void) {
   ++(cpu.rip);
 }
 
-char* get_ip_str(uint8_t size) {
+char* get_ip_str_from_size(uint8_t size) {
   switch( size ) {
     case 2: return "ip";
     case 4: return "eip";
     case 8: return "rip";
+  }
+}
+
+uint8_t* get_ip_addr_from_size(uint8_t size) {
+  switch( size ) {
+    case 2: return &(cpu.ip);
+    case 4: return &(cpu.eip);
+    case 8: return &(cpu.rip);
   }
 }
 
@@ -301,7 +310,15 @@ static char* rep_prefix_str(void) {
 // Thanks to https://ctyme.com/intr/
 static void bios_interrupt_16(void) {
   switch( cpu.ah ) {
-    case 0x0f: {
+    case 0x0E: {
+      // --- TELETYPE OUTPUT ---
+      // USED   al = character
+      // UNUSED bh = page number
+      // USED   bl = foreground color
+      telwin_output(cpu.al);
+      return;
+    }
+    case 0x0F: {
       // --- GET CURRENT VIDEO MODE ---
       // UNUSED ah = number of character columns
       // UNUSED al = display mode
@@ -500,7 +517,7 @@ static void read_modrm(uint8_t operand_sz, uint8_t addr_sz, String modrm, ModRM_
             if( op_mode == LONG_MODE ) {
               const int64_t disp = read_displacement(rip+1, 4);
               cpu.rip += 5; // always relative to the next instruction
-              snprintf(str, len, "[%s%c0x%lx]", get_ip_str(addr_sz), pos_neg[disp<0], disp);
+              snprintf(str, len, "[%s%c0x%lx]", get_ip_str_from_size(addr_sz), pos_neg[disp<0], disp);
               out->flat_addr = get_flat_address(segment, get_ip_from_size(addr_sz) + disp);
             }
             else {
@@ -554,8 +571,193 @@ static void read_modrm(uint8_t operand_sz, uint8_t addr_sz, String modrm, ModRM_
   }
 }
 
-static void swap(void* a, void* b) {
-  void* tmp = a; a = b; b = tmp;
+// **************************
+// ** INSTRUCTION DECODING **
+// **************************
+
+static void decode_gpr_modrm(uint8_t dir, uint8_t operand_sz, char** src_str, uint8_t** src_addr, char** dest_str, uint8_t** dest_addr) {
+  static char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
+  ++(cpu.rip);
+  read_modrm(operand_sz, address_sz(), modrm, &info);
+
+  if( dir == 0 ) {
+    *src_str = get_reg_str(info.reg, operand_sz);
+    *dest_str = modrm.str;
+
+    *src_addr = get_reg_addr(info.reg, operand_sz);
+    if( info.mode == INDIRECT ) *dest_addr = ram + info.flat_addr;
+    if( info.mode == DIRECT )   *dest_addr = info.reg_addr;
+  }
+  else {
+    *src_str = modrm.str;
+    *dest_str = get_reg_str(info.reg, operand_sz);
+
+    if( info.mode == INDIRECT ) *src_addr = ram + info.flat_addr;
+    if( info.mode == DIRECT )   *src_addr = info.reg_addr;
+    *dest_addr = get_reg_addr(info.reg, operand_sz);
+  }
+}
+
+// ***************************
+// ** INSTRUCTION EXECUTION **
+// ***************************
+
+static void exe_add(uint8_t* dest_addr, uint8_t dest_sz, int64_t a, int64_t b) {
+  int64_t c = a + b;
+  memcpy(dest_addr, &c, dest_sz);
+
+  /* OF */ const uint8_t s_a = a < 0, s_b = b < 0, s_c = c < 0;
+  if( (s_a == 0 && s_b == 1) || (s_a == 1 && s_b == 0) ) CLEAR_FLAG(RFLAGS_OF); 
+  if( s_a == 0 && s_b == 0 ) { UPDATE_FLAG(s_c == 1, RFLAGS_OF) }
+  if( s_a == 1 && s_b == 1 ) { UPDATE_FLAG(s_c == 0, RFLAGS_OF) }
+  /* SF */ update_sf_flag(c);
+  /* ZF */ update_zf_flag(c);
+  /* AF */ UPDATE_FLAG( ((uint64_t)a & 0x0F) > ((uint64_t)c & 0x0F), RFLAGS_AF)
+  /* PF */ update_pf_flag(c);
+  /* CF */ UPDATE_FLAG((uint64_t)a > (uint64_t)c, RFLAGS_CF)
+}
+
+static void exe_xor(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
+  uint64_t c = a ^ b;
+  memcpy(dest_addr, &c, dest_sz);
+
+  /* OF */ CLEAR_FLAG(RFLAGS_OF);
+  /* SF */ update_sf_flag(c);
+  /* ZF */ update_zf_flag(c);
+  /* PF */ update_pf_flag(c);
+  /* CF */ CLEAR_FLAG(RFLAGS_CF);
+}
+
+static void update_sub_flags(int64_t a, int64_t b, int64_t c) {
+  /* OF */ const uint8_t s_a = a < 0, s_b = b < 0, s_c = c < 0;
+  if( (s_a == 0 && s_b == 0) || (s_a == 1 && s_b == 1) ) CLEAR_FLAG(RFLAGS_OF); 
+  if( s_a == 0 && s_b == 1 ) { UPDATE_FLAG(s_c == 1, RFLAGS_OF) }
+  if( s_a == 1 && s_b == 0 ) { UPDATE_FLAG(s_c == 0, RFLAGS_OF) }
+  /* SF */ update_sf_flag(c);
+  /* ZF */ update_zf_flag(c);
+  /* AF */ UPDATE_FLAG( ((uint64_t)a & 0x0F) < ((uint64_t)b & 0x0F), RFLAGS_AF)
+  /* PF */ update_pf_flag(c);
+  /* CF */ UPDATE_FLAG((uint64_t)a < (uint64_t)b, RFLAGS_CF)
+}
+
+static void exe_cmp(int64_t a, int64_t b) {
+  update_sub_flags(a, b, a - b);
+}
+
+static void exe_pop(uint8_t* dest_addr, uint8_t dest_sz) {
+  memcpy(dest_addr, ram + get_flat_address(cpu.ss, get_sp()), dest_sz);
+  cpu.rsp += dest_sz;
+}
+
+static void exe_push(uint8_t* src_addr, uint8_t src_sz) {
+  cpu.rsp -= src_sz;
+  memcpy(ram + get_flat_address(cpu.ss, get_sp()), src_addr, src_sz);
+}
+
+static void exe_jcc(uint8_t cond, int64_t disp) {
+  if( cond )
+    cpu.rip += disp;
+}
+
+static void exe_sub(uint8_t* dest_addr, uint8_t dest_sz, int64_t a, int64_t b) {
+  int64_t c = a - b;
+  memcpy(dest_addr, &c, dest_sz);
+  update_sub_flags(a, b, c);
+}
+
+static void exe_mov(uint8_t* dest_addr, uint8_t* src_addr, uint8_t size) {
+  memcpy(dest_addr, src_addr, size);
+}
+
+static void exe_movsb(uint8_t addr_sz) {
+  const uint64_t segment = *overridable_segment_addr(DS);
+
+  uint64_t dest_offset = 0, src_offset = 0;
+  memcpy(&src_offset, get_reg_addr(RSI, addr_sz), addr_sz);
+  memcpy(&dest_offset, get_reg_addr(RDI, addr_sz), addr_sz);
+  
+  uint8_t* src_addr  = ram + get_flat_address(segment, src_offset);
+  uint8_t* dest_addr = ram + get_flat_address(cpu.es, dest_offset);
+  const int8_t dir   = cpu.rflags & RFLAGS_DF ? -1 : 1;
+
+  if( prefixes.g1.present && prefixes.g1.prefix == 0xF3 ) {
+    while( cpu.rcx > 0 ) {
+      *dest_addr = *src_addr;
+      cpu.rsi += dir; cpu.rdi += dir;
+      src_addr += dir; dest_addr += dir;
+      --(cpu.rcx);
+    }
+  }
+  else {
+    *dest_addr = *src_addr;
+    cpu.rsi += dir; cpu.rdi += dir;
+  }
+}
+
+static void exe_lodsb(uint8_t addr_sz) {
+  const uint64_t segment = *overridable_segment_addr(DS);
+
+  uint64_t src_offset = 0;
+  memcpy(&src_offset, get_reg_addr(RSI, addr_sz), addr_sz);
+  
+  uint8_t* src_addr  = ram + get_flat_address(segment, src_offset);
+  uint8_t* dest_addr = get_reg_addr(RAX, 1);
+  const int8_t dir   = cpu.rflags & RFLAGS_DF ? -1 : 1;
+
+  if( prefixes.g1.present && prefixes.g1.prefix == 0xF3 ) {
+    while( cpu.rcx > 0 ) {
+      *dest_addr = *src_addr;
+      cpu.rsi += dir;
+      src_addr += dir;
+      --(cpu.rcx);
+    }
+  }
+  else {
+    *dest_addr = *src_addr;
+    cpu.rsi += dir;
+  }
+}
+
+static void exe_shr(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
+  uint64_t c = a;
+  for(uint64_t i = 0; i < b; ++i) {
+    UPDATE_FLAG(c & 0x1, RFLAGS_CF);
+    c >>= 1;
+  }
+  memcpy(dest_addr, &c, dest_sz);
+  
+  if( b == 1 ) { UPDATE_FLAG((a >> (dest_sz*8 - 1)) & 0x1, RFLAGS_OF) };
+  if( b > 0 ) {
+    update_sf_flag(c);
+    update_zf_flag(c);
+    update_pf_flag(c);
+  }
+}
+
+static void exe_int(uint64_t vector) {
+  if( op_mode == REAL_MODE ) {
+    if( vector == 0x10 ) bios_interrupt_16();
+  }
+}
+
+static void exe_call_rel(uint8_t rip_sz, int64_t disp) {
+  exe_push(get_ip_addr_from_size(rip_sz), rip_sz); 
+  cpu.rip += disp;
+}
+
+static void exe_ret_near(uint8_t rip_sz) {
+  exe_pop(get_ip_addr_from_size(rip_sz), rip_sz);
+}
+
+static void exe_jmp_rel(int64_t disp) {
+  cpu.rip += disp;
+}
+
+static void exe_test(uint64_t a, uint64_t b) {
+  uint64_t c = a & b;
+  update_sf_flag(c);
+  update_zf_flag(c);
+  update_pf_flag(c);
 }
 
 static void decode_one_byte_opcode(String assembly) {
@@ -563,117 +765,43 @@ static void decode_one_byte_opcode(String assembly) {
   char* str = assembly.str;
   uint8_t* opcode = ram_addr_ip();
 
-  // --- MOV ---
-  /*
-  if( (*opcode & 0xFC) == 0x88 ) {
-    // opcodes: 88, 89, 8A, 8B
-    const uint8_t d = (*opcode >> 1) & 0x1;
-    const uint8_t w = (*opcode >> 0) & 0x1;
-    const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
-
-    char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
-    ++(cpu.rip);
-    read_modrm(operand_sz, address_sz(), modrm, &info);
-
-    char* src_str = modrm.str;
-    char* dest_str = get_reg_str(info.reg, operand_sz);
-
-    uint8_t* src_addr; 
-    if( info.mode == INDIRECT ) src_addr = ram + info.flat_addr;
-    if( info.mode == DIRECT )   src_addr = info.reg_addr;
-    uint8_t* dest_addr = get_reg_addr(info.reg, operand_sz);
-    
-    if( d == 0 ) { swap(&src_str, &dest_str); swap(&src_addr, &dest_addr); }
-
-    snprintf(str, len, "MOV  %s, %s", dest_str, src_str);
-    memcpy(dest_addr, src_addr, operand_sz);
-    return;
-  }
-  if( (*opcode & 0xFC) == 0x8C ) {
-
-  }
-  if( (*opcode & 0xFC) == 0xA0 ) {
-
-  }
-  if( (*opcode & 0xF0) == 0xB0 ) {
-
-  }
-  if( (*opcode & 0xFE) == 0xC6 ) {
-
-  }
-  */
-
   switch( *opcode ) {
     case 0x03: {
       const uint8_t operand_sz = rex_ext_operand_sz();
-      char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
-      ++(cpu.rip);
-      read_modrm(operand_sz, address_sz(), modrm, &info);
+      char *src_str, *dest_str;
+      uint8_t *src_addr, *dest_addr;
+      decode_gpr_modrm(1, operand_sz, &src_str, &src_addr, &dest_str, &dest_addr);
       
-      snprintf(str, len, "ADD  %s, %s", get_reg_str(info.reg, operand_sz), modrm.str);
-      
-      uint8_t* src;
-      uint8_t* dest = get_reg_addr(info.reg, operand_sz);
-      if( info.mode == INDIRECT ) src = ram + info.flat_addr;
-      if( info.mode == DIRECT )   src = info.reg_addr;
-      int64_t a = read_displacement(dest, operand_sz);
-      int64_t b = read_displacement(src, operand_sz);
-      int64_t c = a + b;
-      memcpy(dest, &c, operand_sz);
-      /* OF */ const uint8_t s_a = a < 0, s_b = b < 0, s_c = c < 0;
-      if( (s_a == 0 && s_b == 1) || (s_a == 1 && s_b == 0) ) CLEAR_FLAG(RFLAGS_OF); 
-      if( s_a == 0 && s_b == 0 ) { UPDATE_FLAG(s_c == 1, RFLAGS_OF) }
-      if( s_a == 1 && s_b == 1 ) { UPDATE_FLAG(s_c == 0, RFLAGS_OF) }
-      /* SF */ update_sf_flag(c);
-      /* ZF */ update_zf_flag(c);
-      /* AF */ UPDATE_FLAG( ((uint64_t)a & 0x0F) > ((uint64_t)c & 0x0F), RFLAGS_AF)
-      /* PF */ update_pf_flag(c);
-      /* CF */ UPDATE_FLAG((uint64_t)a > (uint64_t)c, RFLAGS_CF)
+      snprintf(str, len, "ADD  %s, %s", dest_str, src_str);
+
+      const int64_t a = read_displacement(dest_addr, operand_sz);
+      const int64_t b = read_displacement(src_addr, operand_sz);
+      exe_add(dest_addr, operand_sz, a, b);
       return;
     }
     case 0x33: {
       const uint8_t operand_sz = rex_ext_operand_sz();
-      char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
-      ++(cpu.rip);
-      read_modrm(operand_sz, address_sz(), modrm, &info);
+      char *src_str, *dest_str;
+      uint8_t *src_addr, *dest_addr;
+      decode_gpr_modrm(1, operand_sz, &src_str, &src_addr, &dest_str, &dest_addr);
       
-      snprintf(str, len, "XOR  %s, %s", get_reg_str(info.reg, operand_sz), modrm.str);
+      snprintf(str, len, "XOR  %s, %s", dest_str, src_str);
       
-      uint8_t* src;
-      uint8_t* dest = get_reg_addr(info.reg, operand_sz);
-      if( info.mode == INDIRECT ) src = ram + info.flat_addr;
-      if( info.mode == DIRECT )   src = info.reg_addr;
-      uint64_t a = read_immediate(dest, operand_sz);
-      uint64_t b = read_immediate(src, operand_sz);
-      uint64_t c = a ^ b;
-      memcpy(dest, &c, operand_sz);
-      /* OF */ CLEAR_FLAG(RFLAGS_OF);
-      /* SF */ update_sf_flag(c);
-      /* ZF */ update_zf_flag(c);
-      /* PF */ update_pf_flag(c);
-      /* CF */ CLEAR_FLAG(RFLAGS_CF);
+      const uint64_t a = read_immediate(dest_addr, operand_sz);
+      const uint64_t b = read_immediate(src_addr, operand_sz);
+      exe_xor(dest_addr, operand_sz, a, b);
       return;
     }
     case 0x3D: {
       const uint8_t operand_sz = rex_ext_operand_sz();
       const uint8_t disp_sz = MIN(operand_sz, 4);
-      int64_t a, c;
-      int64_t b = read_displacement(opcode+1, disp_sz);
+      const int64_t a = read_displacement(get_reg_addr(RAX, operand_sz), operand_sz);
+      const int64_t b = read_displacement(opcode+1, disp_sz);
       cpu.rip += 1 + disp_sz;
 
       snprintf(str, len, "CMP  %s, %c0x%lx", get_reg_str(RAX, operand_sz), pos_neg[b<0], ABS(b));
       
-      a = read_displacement(get_reg_addr(RAX, operand_sz), operand_sz);
-      c = a - b;
-      /* OF */ const uint8_t s_a = a < 0, s_b = b < 0, s_c = c < 0;
-      if( (s_a == 0 && s_b == 0) || (s_a == 1 && s_b == 1) ) CLEAR_FLAG(RFLAGS_OF); 
-      if( s_a == 0 && s_b == 1 ) { UPDATE_FLAG(s_c == 1, RFLAGS_OF) }
-      if( s_a == 1 && s_b == 0 ) { UPDATE_FLAG(s_c == 0, RFLAGS_OF) }
-      /* SF */ update_sf_flag(c); 
-      /* ZF */ update_zf_flag(c); 
-      /* AF */ UPDATE_FLAG( ((uint64_t)a & 0x0F) < ((uint64_t)b & 0x0F), RFLAGS_AF)
-      /* PF */ update_pf_flag(c);
-      /* CF */ UPDATE_FLAG((uint64_t)a < (uint64_t)b, RFLAGS_CF)
+      exe_cmp(a, b);
       return;
     }
     case 0x58:
@@ -686,12 +814,11 @@ static void decode_one_byte_opcode(String assembly) {
     case 0x5F: {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
       const uint8_t opcode_reg = read_reg_in_opcode(opcode);
+      ++(cpu.rip);
 
       snprintf(str, len, "POP  %s", get_reg_str(opcode_reg, operand_sz));
       
-      memcpy(get_reg_addr(opcode_reg, operand_sz), ram + get_flat_address(cpu.ss, get_sp()), operand_sz);
-      cpu.rsp += operand_sz;
-      ++(cpu.rip);
+      exe_pop(get_reg_addr(opcode_reg, operand_sz), operand_sz);
       return;
     }
     case 0x72: {
@@ -700,8 +827,16 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "JB  %c0x%lx", pos_neg[disp<0], ABS(disp));
 
-      if( cpu.rflags & RFLAGS_CF )
-        cpu.rip += disp;
+      exe_jcc(cpu.rflags & RFLAGS_CF, disp);
+      return;
+    }
+    case 0x74: {
+      const int64_t disp = read_displacement(opcode+1, 1);
+      cpu.rip += 2;
+
+      snprintf(str, len, "JE  %c0x%lx", pos_neg[disp<0], ABS(disp));
+
+      exe_jcc(cpu.rflags & RFLAGS_ZF, disp);
       return;
     }
     case 0x83: {
@@ -713,41 +848,46 @@ static void decode_one_byte_opcode(String assembly) {
 
       switch( info.reg ) {
         case 5: {
-          int64_t a, c;
+          uint8_t* dest_addr;
+          if( info.mode == INDIRECT ) dest_addr = ram + info.flat_addr;
+          if( info.mode == DIRECT )   dest_addr = info.reg_addr;
+          int64_t a = read_displacement(dest_addr, operand_sz);
           int64_t b = read_displacement(post_modrm, 1);
           ++(cpu.rip);
 
           snprintf(str, len, "SUB  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
-          
-          uint8_t* dest;
-          if( info.mode == INDIRECT ) dest = ram + info.flat_addr;
-          if( info.mode == DIRECT )   dest = info.reg_addr;
-          a = read_displacement(dest, operand_sz);
-          c = a - b;
-          memcpy(dest, &c, operand_sz);
-          /* OF */ const uint8_t s_a = a < 0, s_b = b < 0, s_c = c < 0;
-          if( (s_a == 0 && s_b == 0) || (s_a == 1 && s_b == 1) ) CLEAR_FLAG(RFLAGS_OF); 
-          if( s_a == 0 && s_b == 1 ) { UPDATE_FLAG(s_c == 1, RFLAGS_OF) }
-          if( s_a == 1 && s_b == 0 ) { UPDATE_FLAG(s_c == 0, RFLAGS_OF) }
-          /* SF */ update_sf_flag(c); 
-          /* ZF */ update_zf_flag(c); 
-          /* AF */ UPDATE_FLAG( ((uint64_t)a & 0x0F) < ((uint64_t)b & 0x0F), RFLAGS_AF)
-          /* PF */ update_pf_flag(c);
-          /* CF */ UPDATE_FLAG((uint64_t)a < (uint64_t)b, RFLAGS_CF)
+
+          exe_sub(dest_addr, operand_sz, a, b);
           return;
         }
       }
     }
-    case 0x88: {
-      char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
-      ++(cpu.rip);
-      read_modrm(1, address_sz(), modrm, &info);
+    case 0x84: {
+      char *src_str, *dest_str;
+      uint8_t *src_addr, *dest_addr;
+      decode_gpr_modrm(0, 1, &src_str, &src_addr, &dest_str, &dest_addr);
 
-      snprintf(str, len, "MOV  %s, %s", modrm.str, get_reg_str(info.reg, 1));
+      snprintf(str, len, "TEST  %s, %s", dest_str, src_str);
 
-      uint8_t* src = get_reg_addr(info.reg, 1);
-      if( info.mode == INDIRECT ) memcpy(ram + info.flat_addr, src, 1);
-      if( info.mode == DIRECT )   *info.reg_addr = *src;
+      uint64_t a = read_immediate(dest_addr, 1);
+      uint64_t b = read_immediate(src_addr, 1);
+      exe_test(a, b);
+      return;     
+    }
+    case 0x88: 
+    case 0x89: 
+    case 0x8A:
+    case 0x8B: {
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t d = (*opcode >> 1) & 0x1;
+      const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
+      char *src_str, *dest_str;
+      uint8_t *src_addr, *dest_addr;
+      decode_gpr_modrm(d, operand_sz, &src_str, &src_addr, &dest_str, &dest_addr);
+
+      snprintf(str, len, "MOV  %s, %s", dest_str, src_str);
+
+      exe_mov(dest_addr, src_addr, operand_sz);
       return;
     }
     case 0x8C: {
@@ -757,9 +897,11 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "MOV  %s, %s", modrm.str, seg_reg_str[info.reg]);
 
-      uint16_t* seg_reg = seg_reg_addr[info.reg];
-      if( info.mode == INDIRECT ) memcpy(ram + info.flat_addr, seg_reg, 2);
-      if( info.mode == DIRECT )   *(uint16_t*)(info.reg_addr) = *seg_reg;
+      uint8_t* src_addr = seg_reg_addr[info.reg];
+      uint8_t* dest_addr;
+      if( info.mode == INDIRECT ) dest_addr = ram + info.flat_addr;
+      if( info.mode == DIRECT )   dest_addr = info.reg_addr;
+      exe_mov(dest_addr, src_addr, 2);
       return;
     }
     case 0x8E: {
@@ -769,39 +911,34 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "MOV  %s, %s", seg_reg_str[info.reg], modrm.str);
 
-      uint16_t* seg_reg = seg_reg_addr[info.reg];
-      if( info.mode == INDIRECT ) memcpy(seg_reg, ram + info.flat_addr, 2);
-      if( info.mode == DIRECT )   *seg_reg = *(uint16_t*)(info.reg_addr);
+      uint8_t* src_addr;
+      if( info.mode == INDIRECT ) src_addr = ram + info.flat_addr;
+      if( info.mode == DIRECT )   src_addr = info.reg_addr;
+      uint8_t* dest_addr = seg_reg_addr[info.reg];
+      exe_mov(dest_addr, src_addr, 2);
       return;
     }
     case 0xA4: {
       const uint8_t addr_sz = address_sz();
 
-      snprintf(str, len, "%sMOVSB  es:[%s] %s:[%s]", rep_prefix_str(),
-                                                     get_reg_str(RDI, addr_sz),
-                                                     overridable_segment_str(DS),
-                                                     get_reg_str(RSI, addr_sz));
+      snprintf(str, len, "%sMOVSB  es:[%s], %s:[%s]", rep_prefix_str(),
+                                                      get_reg_str(RDI, addr_sz),
+                                                      overridable_segment_str(DS),
+                                                      get_reg_str(RSI, addr_sz));
       
-      uint64_t segment = *overridable_segment_addr(DS);
-      uint64_t count = 0;
-      if( prefixes.g1.present && prefixes.g1.prefix == 0xF3 )
-        memcpy(&count, get_reg_addr(RCX, addr_sz), addr_sz);
-      else
-        count = 1;
-      uint64_t dest_offset = 0, src_offset = 0;
-      memcpy(&dest_offset, get_reg_addr(RDI, addr_sz), addr_sz);
-      memcpy(&src_offset, get_reg_addr(RSI, addr_sz), addr_sz);
-      uint8_t* dest = ram + get_flat_address(cpu.es, dest_offset);
-      uint8_t* src  = ram + get_flat_address(segment, src_offset);
-      int8_t dir    = ((cpu.rflags & RFLAGS_DF) / RFLAGS_DF) * -2 + 1;
-      for(uint64_t i = 0; i < count; ++i) {
-        //memcpy(dest, src, 1); i was very tired :)
-        *dest = *src; // there you go, it was in fact the bottleneck
-        cpu.rsi += dir; cpu.rdi += dir;
-        src += dir; dest += dir;
-      }
-      cpu.rcx = 0;
       ++(cpu.rip);
+      exe_movsb(addr_sz);
+      return;
+    }
+    case 0xAC: {
+      const uint8_t addr_sz = address_sz();
+
+      snprintf(str, len, "%sLODSB  al, %s:[%s]", rep_prefix_str(),
+                                                 overridable_segment_str(DS),
+                                                 get_reg_str(RSI, addr_sz));
+      
+      ++(cpu.rip);
+      exe_lodsb(addr_sz);
       return;
     }
     case 0xB0:
@@ -818,7 +955,7 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "MOV  %s, 0x%lx", get_reg_str(opcode_reg, 1), immediate);
       
-      memcpy(get_reg_addr(opcode_reg, 1), opcode+1, 1);
+      exe_mov(get_reg_addr(opcode_reg, 1), opcode+1, 1);
       return;
     }
     case 0xB8:
@@ -836,7 +973,7 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "MOV  %s, 0x%lx", get_reg_str(opcode_reg, operand_sz), immediate);
       
-      memcpy(get_reg_addr(opcode_reg, operand_sz), opcode+1, operand_sz);
+      exe_mov(get_reg_addr(opcode_reg, operand_sz), opcode+1, operand_sz);
       return;
     }
     case 0xC1: {
@@ -848,32 +985,26 @@ static void decode_one_byte_opcode(String assembly) {
 
       switch( info.reg ) {
         case 5: {
-          uint64_t a, c;
+          uint8_t* dest_addr;
+          if( info.mode == INDIRECT ) dest_addr = ram + info.flat_addr;
+          if( info.mode == DIRECT )   dest_addr = info.reg_addr;
+          uint64_t a = read_immediate(dest_addr, operand_sz);
           uint64_t b = read_immediate(post_modrm, 1);
           if( operand_sz == 8 ) { b &= 0x3F; } else { b &= 0x1F; }
           ++(cpu.rip);
           
           snprintf(str, len, "SHR  %s, 0x%lx", modrm.str, b);
           
-          uint8_t* dest;
-          if( info.mode == INDIRECT ) dest = ram + info.flat_addr;
-          if( info.mode == DIRECT )   dest = info.reg_addr;
-          c = a = read_immediate(dest, operand_sz);
-          for(uint64_t i = 0; i < b; ++i) {
-            UPDATE_FLAG(c & 0x1, RFLAGS_CF);
-            c >>= 1;
-          }
-          memcpy(dest, &c, operand_sz);
-          
-          if( b == 1 ) { UPDATE_FLAG((a >> (operand_sz*8 - 1)) & 0x1, RFLAGS_OF) };
-          if( b > 0 ) {
-            update_sf_flag(c);
-            update_zf_flag(c);
-            update_pf_flag(c);
-          }
+          exe_shr(dest_addr, operand_sz, a, b);
           return;
         }
       }
+    }
+    case 0xC3: {
+      snprintf(str, len, "RET");
+
+      exe_ret_near(not_rex_ext_operand_sz());
+      return;
     }
     case 0xCD: {
       const uint64_t imm = read_immediate(opcode+1, 1);
@@ -881,22 +1012,18 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "INT  0x%lx", imm);
 
-      if( op_mode == REAL_MODE ) {
-        if( imm == 0x10 ) bios_interrupt_16();
-      }
+      exe_int(imm);
       return;
     }
     case 0xE8: {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
       const uint8_t disp_sz    = MIN(operand_sz, 4);
       const int64_t disp = read_displacement(opcode+1, disp_sz);
+      cpu.rip += 1 + disp_sz;
       
       snprintf(str, len, "CALL  %c0x%lx", pos_neg[disp<0], ABS(disp));
       
-      uint64_t n_rip = get_ip_from_size(operand_sz) + 1 + disp_sz;
-      cpu.rsp -= operand_sz;
-      memcpy(ram + get_flat_address(cpu.ss, get_sp()), &n_rip, operand_sz);
-      cpu.rip += 1 + disp_sz + disp;
+      exe_call_rel(operand_sz, disp);
       return;
     }
     case 0xEA: {
@@ -905,34 +1032,71 @@ static void decode_one_byte_opcode(String assembly) {
       const uint64_t offset  = read_immediate(opcode+1, operand_sz);
       
       snprintf(str, len, "JMP  0x%lx:0x%lx", segment, offset);
-      
+     
       cpu.cs = segment;
       cpu.rip = offset;
       return;
     }
+    case 0xEB: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
+      const int64_t disp = read_displacement(opcode+1, 1);
+      cpu.rip += 2;
+      
+      snprintf(str, len, "JMP  %c0x%lx", pos_neg[disp<0], ABS(disp));
+      
+      exe_jmp_rel(disp);
+      return;
+    }
     case 0xFA: {
+      ++(cpu.rip);
+
       snprintf(str, len, "CLI");
       
       CLEAR_FLAG(RFLAGS_IF);
-      ++(cpu.rip);
       return;
     }
     case 0xFB: {
+      ++(cpu.rip);
+
       snprintf(str, len, "STI");
       
       SET_FLAG(RFLAGS_IF);
-      ++(cpu.rip);
       return;
     }
     case 0xFC: {
+      ++(cpu.rip);
+
       snprintf(str, len, "CLD");
       
       CLEAR_FLAG(RFLAGS_DF);
-      ++(cpu.rip);
       return;
     }
     default: panic("The 1 byte instruction was not implemented!");
   }
+}
+
+static void exe_cpuid(void) {
+  switch( cpu.eax ) {
+    case 0x80000000: {
+      // Maximum input value for CPUID of the form 80 00 00 0*
+      cpu.eax = 0x80000008;
+      break;
+    }
+    case 0x80000001: {
+      // EAX = extended processor signature and feature bits (???)
+      // EBX = reserved
+      // ECX = some shit
+      // EDX = some shit + bit 29: is 64-bit mode available (important)
+      cpu.edx = 1 << 29;
+      break;
+    }
+  }
+}
+
+static void exe_bt(uint8_t* bit_base, uint8_t base_sz, uint64_t bit_offset) {
+  uint64_t tmp = 0;
+  memcpy(&tmp, bit_base, base_sz);
+  UPDATE_FLAG((tmp >> bit_offset) & 0x1, RFLAGS_CF);
 }
 
 static void decode_two_byte_opcode(String assembly) {
@@ -942,24 +1106,11 @@ static void decode_two_byte_opcode(String assembly) {
 
   switch( *opcode ) {
     case 0xA2: {
+      ++(cpu.rip);
+
       snprintf(str, len, "CPUID");
 
-      switch( cpu.eax ) {
-        case 0x80000000: {
-          // Maximum input value for CPUID of the form 80 00 00 0*
-          cpu.eax = 0x80000008;
-          break;
-        }
-        case 0x80000001: {
-          // EAX = extended processor signature and feature bits (???)
-          // EBX = reserved
-          // ECX = some shit
-          // EDX = some shit + bit 29: is 64-bit mode available (important)
-          cpu.edx = 1 << 29;
-          break;
-        }
-      }
-      ++(cpu.rip);
+      exe_cpuid();
       return;
     }
     case 0xBA: {
@@ -971,17 +1122,15 @@ static void decode_two_byte_opcode(String assembly) {
 
       switch( info.reg ) {
         case 4: {
+          uint8_t* bit_base;
+          if( info.mode == INDIRECT ) bit_base = ram + info.flat_addr;
+          if( info.mode == DIRECT )   bit_base = info.reg_addr;
           const uint64_t bit_offset = read_immediate(post_modrm, 1) % (operand_sz * 8);
           ++(cpu.rip);
 
           snprintf(str, len, "BT  %s, 0x%lx", modrm.str, bit_offset);
           
-          uint8_t* bit_base;
-          if( info.mode == INDIRECT ) bit_base = ram + info.flat_addr;
-          if( info.mode == DIRECT )   bit_base = info.reg_addr;
-          uint64_t tmp = 0;
-          memcpy(&tmp, bit_base, operand_sz);
-          UPDATE_FLAG((tmp >> bit_offset) & 0x1, RFLAGS_CF);
+          exe_bt(bit_base, operand_sz, bit_offset);
           return;
         }
       }

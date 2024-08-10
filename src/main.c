@@ -224,6 +224,15 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   wattroff(win, A_REVERSE);
 }
 
+WINDOW* telwin;
+int32_t telcur_x = 1, telcur_y = 1;
+
+void telwin_output(char c) {
+  mvwprintw(telwin, telcur_y, telcur_x, "%c", c);
+  ++telcur_x;
+  wrefresh(telwin);
+}
+
 int32_t main(void) {
   init_ram();
   init_disk();
@@ -276,6 +285,15 @@ int32_t main(void) {
 
   draw_regwin(regwin, reg_width, reg_height);
   wrefresh(regwin);
+
+  // teletype
+  const int32_t tel_width  = 32;
+  const int32_t tel_height = hex_height + ctrl_height;
+  telwin = newwin(tel_height, tel_width, 0, hex_width);
+  wrefresh(stdwin);
+
+  box(telwin, 0, 0);
+  wrefresh(telwin);
 
   int32_t c;
   while( (c = wgetch(stdwin)) != 'q' ) {
