@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+extern uint8_t* ram;
+
 extern void panic(const char* msg);
 
 typedef enum { REAL_MODE, PROTECTED_MODE, LONG_MODE } OperationMode;
@@ -40,6 +42,8 @@ typedef struct {
 
   uint64_t cr0, cr1, cr2, cr3, cr4;
   uint64_t IA32_EFER;
+
+  uint8_t io_ports[65536];
 }
 x64_CPU;
 
@@ -113,7 +117,12 @@ void init_cpu(void) {
 uint64_t get_flat_address(uint64_t segment, uint64_t offset) {
   switch( op_mode ) {
     case REAL_MODE: return (segment << 4) + offset;
-    default:        panic("Flat address for 32, 64 bit modes isn't implemented!");
+    case PROTECTED_MODE: {
+      uint8_t* seg_desc = ram + cpu.gdtr.base + segment*8;
+      const uint64_t flat_addr = (*(seg_desc+7) << 24) | (*(seg_desc+4) << 16) | *(uint16_t*)(seg_desc+2);
+      return flat_addr + offset;
+    }
+    default: panic("Flat address for 64 bit mode isn't implemented!");
   }
 }
 

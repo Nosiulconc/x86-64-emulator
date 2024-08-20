@@ -22,8 +22,8 @@ x64_CPU cpu;
 OperationMode op_mode;
 uint64_t inst_counter;
 
-#define RAM_CAPACITY   32000000 // 512 Mb
-#define DISK_CAPACITY  32000000 //  32 Mb
+const uint64_t RAM_CAPACITY = 32000000;
+const uint64_t DISK_CAPACITY = 32000000;
 
 uint8_t* ram;
 uint8_t* disk;
@@ -227,9 +227,12 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 8, 33, "CR0");
   mvwprintw(win, 9, 33, "PE:%lu", GET_CR0(CR0_PE));
 
+  mvwprintw(win, 4, 35, "gdtr: %04x:%016lx", cpu.gdtr.limit, cpu.gdtr.base);
+  mvwprintw(win, 5, 35, "idtr: %04x:%016lx", cpu.idtr.limit, cpu.idtr.base);
+
   wattron(win, A_REVERSE);
   mvwprintw(win, 1, 35, "rip: %016lx", cpu.rip);
-  mvwprintw(win, 4, 35, "%s", assembly.str);
+  mvwprintw(win, 2, 35, "%s", assembly.str);
   wattroff(win, A_REVERSE);
 }
 
@@ -332,6 +335,7 @@ int32_t main(void) {
 
   draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
   wrefresh(hexwin);
+  werase(regwin);
   draw_regwin(regwin, reg_width, reg_height);
   wrefresh(regwin);
 
@@ -404,9 +408,11 @@ int32_t main(void) {
         }
 
       exit_run_until:
-        werase(hexwin);
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
         wrefresh(hexwin);
+        werase(regwin);
+        draw_regwin(regwin, reg_width, reg_height);
+        wrefresh(regwin);
         break;
       }
     }
