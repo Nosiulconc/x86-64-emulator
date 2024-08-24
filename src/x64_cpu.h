@@ -2,12 +2,18 @@
 #define _X64_CPU_H_
 
 #include <stdint.h>
-
-extern uint8_t* ram;
+#include <stdlib.h>
 
 extern void panic(const char* msg);
 
 typedef enum { REAL_MODE, PROTECTED_MODE, LONG_MODE } OperationMode;
+
+typedef struct {
+  uint64_t base_addr;
+  uint8_t db : 1;
+  uint8_t l  : 1;
+}
+SegRegCache;
 
 typedef struct {
   union { uint64_t rax; uint32_t eax; uint16_t ax; struct { uint8_t al; uint8_t ah; }; };
@@ -32,7 +38,8 @@ typedef struct {
 
   union { uint64_t rip;    uint32_t eip;    uint16_t ip;    };
   union { uint64_t rflags; uint32_t eflags; uint16_t flags; };
-  
+ 
+  SegRegCache cs_cache, ss_cache, ds_cache, es_cache, fs_cache, gs_cache;
   uint16_t cs, ss, ds, es, fs, gs;
   
   struct { uint16_t limit; uint64_t base; } gdtr; 
@@ -60,12 +67,22 @@ x64_CPU;
 
 extern OperationMode op_mode;
 extern x64_CPU cpu;
+extern uint8_t* ram;
 
-OperationMode get_cpu_operation_mode(void) {
-  if( (cpu.cr0 & CR0_PE) == 0 )
-    return REAL_MODE;
-
-  return PROTECTED_MODE;
+void cpu_operation_mode_transition(void) {
+  switch( op_mode ) {
+    case REAL_MODE: {
+      // The CPU goes to protected mode only after the code segment has been set explicitly
+      if( (cpu.cr0 & CR0_PE) == 1 )
+        op_mode = PROTECTED_MODE;
+      break;
+    }
+    case PROTECTED_MODE: {
+      // TODO transition to long mode
+      break;
+    }
+    case LONG_MODE: break;
+  }
 }
 
 void init_cpu(void) {
@@ -78,11 +95,22 @@ void init_cpu(void) {
   cpu.cr3        = 0x0;
   cpu.cr4        = 0x0;
   
+  cpu.cs_cache   = (SegRegCache){ 0 };
   cpu.cs         = 0x0;
+
+  cpu.ss_cache   = (SegRegCache){ 0 };
   cpu.ss         = 0x0;
+  
+  cpu.ds_cache   = (SegRegCache){ 0 };
   cpu.ds         = 0x0;
+
+  cpu.es_cache   = (SegRegCache){ 0 };
   cpu.es         = 0x0;
+
+  cpu.fs_cache   = (SegRegCache){ 0 };
   cpu.fs         = 0x0;
+
+  cpu.gs_cache   = (SegRegCache){ 0 };
   cpu.gs         = 0x0;
 
   cpu.rdx        = 0x0; // cleared: model info is not used anyways
@@ -114,16 +142,37 @@ void init_cpu(void) {
   cpu.IA32_EFER  = 0x0;
 }
 
-uint64_t get_flat_address(uint64_t segment, uint64_t offset) {
+uint64_t get_segment_descriptor(uint64_t segment) {
+  if( segment & 0b100 ) panic("LDT addressing not implemented!");
+  return *(uint64_t*)(ram + cpu.gdtr.base + (segment >> 3)*8);
+}
+
+typedef enum { ES, CS, SS, DS, FS, GS } SegmentRegister;
+
+char* seg_reg_str[] = {"es","cs","ss","ds","fs","gs"};
+
+uint16_t* seg_reg_addr[] = {&(cpu.es),&(cpu.cs),&(cpu.ss),&(cpu.ds),&(cpu.fs),&(cpu.gs)};
+
+SegRegCache* seg_reg_cache[] = {&(cpu.es_cache),&(cpu.cs_cache),&(cpu.ss_cache),
+                                &(cpu.ds_cache),&(cpu.fs_cache),&(cpu.gs_cache)};
+
+static void set_seg_reg(SegmentRegister seg_reg, uint64_t segment) {
+  memcpy(seg_reg_addr[seg_reg], &segment, 2);
   switch( op_mode ) {
-    case REAL_MODE: return (segment << 4) + offset;
+    case REAL_MODE: seg_reg_cache[seg_reg]->base_addr = segment << 4; break;
     case PROTECTED_MODE: {
-      uint8_t* seg_desc = ram + cpu.gdtr.base + segment*8;
-      const uint64_t flat_addr = (*(seg_desc+7) << 24) | (*(seg_desc+4) << 16) | *(uint16_t*)(seg_desc+2);
-      return flat_addr + offset;
+      const uint64_t seg_desc = get_segment_descriptor(segment);
+      seg_reg_cache[seg_reg]->base_addr = ((seg_desc >> 32) & 0xFF000000) | ((seg_desc >> 16) & 0xFFFFFF);
+      seg_reg_cache[seg_reg]->db = (seg_desc >> 54) & 0x1;
+      seg_reg_cache[seg_reg]->l = (seg_desc >> 53) & 0x1;
+      break;
     }
-    default: panic("Flat address for 64 bit mode isn't implemented!");
+    default: panic("Setting a segment register in long mode isn't implemented!");
   }
+}
+
+uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
+  return seg_reg_cache[seg_reg]->base_addr + offset;
 }
 
 uint64_t get_ip(void) {

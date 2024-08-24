@@ -19,7 +19,7 @@ void panic(const char* msg) {
 // ******************* // 
 
 x64_CPU cpu;
-OperationMode op_mode;
+OperationMode op_mode = REAL_MODE;
 uint64_t inst_counter;
 
 const uint64_t RAM_CAPACITY = 32000000;
@@ -111,7 +111,7 @@ static void save_inst_counter_to_file(const char* path) {
 static void load_bootloader_into_ram(void) {
   // loosely following the EL TORITO specification
 
-  uint32_t default_entry_ptr = (*(uint32_t*)(disk + 0x8847)) * 2048 + 32;
+  const uint64_t default_entry_ptr = (*(uint32_t*)(disk + 0x8847)) * 2048 + 32;
     
   if( disk[default_entry_ptr] == 0 )
     panic("Default entry is marked as not bootable!");
@@ -119,12 +119,12 @@ static void load_bootloader_into_ram(void) {
   if( disk[default_entry_ptr + 1] != 0 )
     panic("Can only handle \"no emulation\" boot media type!");
 
-  uint16_t load_segment = *(uint16_t*)(disk + default_entry_ptr + 2);
+  uint64_t load_segment = *(uint16_t*)(disk + default_entry_ptr + 2);
   if( load_segment == 0 )
     load_segment = 0x7C0;
 
-  uint16_t sector_count   = *(uint16_t*)(disk + default_entry_ptr + 6);
-  uint32_t bootloader_ptr = (*(uint32_t*)(disk + default_entry_ptr + 8)) * 2048;
+  const uint64_t sector_count   = *(uint16_t*)(disk + default_entry_ptr + 6);
+  const uint64_t bootloader_ptr = (*(uint32_t*)(disk + default_entry_ptr + 8)) * 2048;
 
   if( load_segment * 16 + sector_count * 2048 > RAM_CAPACITY )
     panic("Not enought RAM to load the bootloader!");
@@ -140,7 +140,7 @@ char str[29] = "none";
 String assembly = { 28, str };
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
-  uint8_t* rip = base_addr + get_flat_address(cpu.cs, get_ip());
+  uint8_t* rip = base_addr + get_flat_address(CS, get_ip());
   const uint8_t vert_offset = 3;
 
   mvwprintw(win, 1,  1, "----------------");
@@ -276,7 +276,6 @@ int32_t main(void) {
   init_ram();
   init_disk();
   init_cpu();
-  op_mode = get_cpu_operation_mode();
 
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
   load_bootloader_into_ram();
@@ -375,7 +374,7 @@ int32_t main(void) {
         break;
       }
       case 'j': {
-        uint64_t seg = (get_flat_address(cpu.cs, get_ip()) >> 4) << 4;
+        uint64_t seg = (get_flat_address(CS, get_ip()) >> 4) << 4;
         hex_addr = hex_base_addr + seg;
 
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
@@ -402,12 +401,13 @@ int32_t main(void) {
         if( get_input_hex(hexwin, hex_width, hex_height, &addr) )
           goto exit_run_until;
 
-        while( get_flat_address(cpu.cs, get_ip()) != addr ) {
+        while( get_flat_address(CS, get_ip()) != addr ) {
           decode_instruction(assembly);
           ++inst_counter;
         }
 
       exit_run_until:
+        werase(hexwin);
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
         wrefresh(hexwin);
         werase(regwin);
