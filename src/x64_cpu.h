@@ -54,16 +54,25 @@ typedef struct {
 }
 x64_CPU;
 
-#define RFLAGS_CF (uint64_t)(1 <<  0)
-#define RFLAGS_PF (uint64_t)(1 <<  2)
-#define RFLAGS_AF (uint64_t)(1 <<  4)
-#define RFLAGS_ZF (uint64_t)(1 <<  6)
-#define RFLAGS_SF (uint64_t)(1 <<  7)
-#define RFLAGS_IF (uint64_t)(1 <<  9)
-#define RFLAGS_DF (uint64_t)(1 << 10)
-#define RFLAGS_OF (uint64_t)(1 << 11)
+#define RFLAGS_CF ((uint64_t)1 <<  0)
+#define RFLAGS_PF ((uint64_t)1 <<  2)
+#define RFLAGS_AF ((uint64_t)1 <<  4)
+#define RFLAGS_ZF ((uint64_t)1 <<  6)
+#define RFLAGS_SF ((uint64_t)1 <<  7)
+#define RFLAGS_IF ((uint64_t)1 <<  9)
+#define RFLAGS_DF ((uint64_t)1 << 10)
+#define RFLAGS_OF ((uint64_t)1 << 11)
 
-#define CR0_PE (uint64_t)(1 << 0) // 0 = 16-bit real mode, 1 = 32-bit protected mode
+#define CR0_PE ((uint64_t)1 <<  0) // 0 = 16-bit real mode, 1 = protected mode
+#define CR0_ET ((uint64_t)1 <<  4) // 1 = support of Intel 387 DX math coprocessor instructions
+#define CR0_NE ((uint64_t)1 <<  5) // 1 = native mechanism for reporting x87 FPU errors enabled
+#define CR0_PG ((uint64_t)1 << 31) // 1 = paging enabled
+
+#define CR4_PSE ((uint64_t)1 << 4) // 1 = page size extension
+#define CR4_PAE ((uint64_t)1 << 5) // 1 = physical address extension
+#define CR4_PGE ((uint64_t)1 << 7) // 1 = page global enabled
+
+#define EFER_LME ((uint64_t)1 << 8) // 0 = protected mode, 1 = long mode
 
 extern OperationMode op_mode;
 extern x64_CPU cpu;
@@ -72,13 +81,13 @@ extern uint8_t* ram;
 void cpu_operation_mode_transition(void) {
   switch( op_mode ) {
     case REAL_MODE: {
-      // The CPU goes to protected mode only after the code segment has been set explicitly
-      if( (cpu.cr0 & CR0_PE) == 1 )
+      if( cpu.cr0 & CR0_PE )
         op_mode = PROTECTED_MODE;
       break;
     }
     case PROTECTED_MODE: {
-      // TODO transition to long mode
+      if( (cpu.IA32_EFER & EFER_LME) && (cpu.cr4 & CR4_PAE) && (cpu.cr0 & CR0_PG) )
+        op_mode = LONG_MODE;
       break;
     }
     case LONG_MODE: break;
@@ -160,6 +169,7 @@ static void set_seg_reg(SegmentRegister seg_reg, uint64_t segment) {
   memcpy(seg_reg_addr[seg_reg], &segment, 2);
   switch( op_mode ) {
     case REAL_MODE: seg_reg_cache[seg_reg]->base_addr = segment << 4; break;
+    case LONG_MODE:
     case PROTECTED_MODE: {
       const uint64_t seg_desc = get_segment_descriptor(segment);
       seg_reg_cache[seg_reg]->base_addr = ((seg_desc >> 32) & 0xFF000000) | ((seg_desc >> 16) & 0xFFFFFF);
@@ -167,11 +177,71 @@ static void set_seg_reg(SegmentRegister seg_reg, uint64_t segment) {
       seg_reg_cache[seg_reg]->l = (seg_desc >> 53) & 0x1;
       break;
     }
-    default: panic("Setting a segment register in long mode isn't implemented!");
   }
 }
 
 uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
+  if( cpu.cr0 & CR0_PG ) {
+    if( op_mode != LONG_MODE )
+      panic("Paging is only supported in long mode!");
+    // pagingmaxxing
+    if( cpu.cs_cache.l ) {
+      const uint64_t pml4_addr = cpu.cr3 & 0x000FFFFFFFFFF000;
+      const uint64_t pml4e_index = (offset >> 39) & 0x1FF;
+      const uint64_t pml4e = *(uint64_t*)(ram + pml4_addr + pml4e_index*8);
+
+      const uint64_t pdpt_addr = pml4e & 0x000FFFFFFFFFF000;
+      const uint64_t pdpte_index = (offset >> 30) & 0x1FF;
+      const uint64_t pdpte = *(uint64_t*)(ram + pdpt_addr + pdpte_index*8);
+
+      if( (pdpte >> 7) & 0x1 )
+        panic("No support for 1 GB pages!");
+      const uint64_t pd_addr = pdpte & 0x000FFFFFFFFFF000;
+      const uint64_t pde_index = (offset >> 21) & 0x1FF;
+      const uint64_t pde = *(uint64_t*)(ram + pd_addr + pde_index*8);
+
+      if( (pde >> 7) & 0x1 ) {
+        // 2 MB page
+        const uint64_t page_addr = pde & 0x000FFFFFFFF00000;
+        const uint64_t page_index = offset & 0x1FFFFF;
+        return page_addr + page_index;
+      }
+
+      const uint64_t pt_addr = pde & 0x000FFFFFFFFFF000;
+      const uint64_t pte_index = (offset >> 12) & 0x1FF;
+      const uint64_t pte = *(uint64_t*)(ram + pt_addr + pte_index*8);
+
+      const uint64_t page_addr = pte & 0x000FFFFFFFFFF000;
+      const uint64_t page_index = (offset >> 0) & 0xFFF;
+      return page_addr + page_index;
+    }
+    else {
+      // TODO figure y the farcall to long mode cs is accessed like there's no paging
+
+      const uint64_t linear_addr = seg_reg_cache[seg_reg]->base_addr + offset;
+      return linear_addr;
+
+      const uint64_t pdpt_addr = cpu.cr3 & 0x000FFFFFFFFFF000;
+      const uint64_t pdpte_index = (linear_addr >> 30) & 0x2;
+      const uint64_t pdpte = *(uint64_t*)(ram + pdpt_addr + pdpte_index*8);
+
+      if( (pdpte >> 7) & 0x1 )
+        panic("No support for 1 GB pages!");
+      const uint64_t pd_addr = pdpte & 0x000FFFFFFFFFF000;
+      const uint64_t pde_index = (linear_addr >> 21) & 0x1FF;
+      const uint64_t pde = *(uint64_t*)(ram + pd_addr + pde_index*8);
+
+      if( (pde >> 7) & 0x1 )
+        panic("No support for 2 MB pages!");
+      const uint64_t pt_addr = pde & 0x000FFFFFFFFFF000;
+      const uint64_t pte_index = (linear_addr >> 12) & 0x1FF;
+      const uint64_t pte = *(uint64_t*)(ram + pt_addr + pte_index*8);
+
+      const uint64_t page_addr = pte & 0x000FFFFFFFFFF000;
+      const uint64_t page_index = (linear_addr >> 0) & 0xFFF;
+      return page_addr + page_index;
+    }
+  }
   return seg_reg_cache[seg_reg]->base_addr + offset;
 }
 

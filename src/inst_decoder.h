@@ -18,6 +18,9 @@
 
 #define GET_RFLAGS(flag) ((cpu.rflags & flag) / flag)
 #define GET_CR0(flag) ((cpu.cr0 & flag) / flag)
+#define GET_CR3(flag) ((cpu.cr3 & flag) / flag)
+#define GET_CR4(flag) ((cpu.cr4 & flag) / flag)
+#define GET_EFER(flag) ((cpu.IA32_EFER & flag) / flag)
 
 #define GET_MSB(val, size) ((val >> (size - 1)) & 0x1)
 
@@ -204,7 +207,7 @@ static int64_t read_signed(uint8_t* addr, uint8_t size) {
     ++addr;
   }
   // sign extension
-  const uint8_t sign = (s >> (size*8 - 1)) & 0x1;
+  const uint8_t sign = GET_MSB(s, size*8);
   const uint64_t fill = sign ? 0xFF : 0x00;
   for(uint64_t i = size; i < 8; ++i)
     s |= fill << (i<<3);
@@ -396,7 +399,8 @@ static void bios_interrupt_16(void) {
           //
           // UNUSED es:[di] = CRTC information block
 
-          create_io_thread();
+          // TODO keep an eye on this
+          // create_io_thread();
 
           cpu.al = 0x4F;
           cpu.ah = 0;
@@ -793,6 +797,17 @@ static void exe_or(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) 
   /* CF */ CLEAR_FLAG(RFLAGS_CF);
 }
 
+static void exe_and(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
+  uint64_t c = a & b;
+  memcpy(dest_addr, &c, dest_sz);
+
+  /* OF */ CLEAR_FLAG(RFLAGS_OF);
+  /* SF */ update_sf_flag(c);
+  /* ZF */ update_zf_flag(c);
+  /* PF */ update_pf_flag(c);
+  /* CF */ CLEAR_FLAG(RFLAGS_CF);
+}
+
 static void update_sub_flags(int64_t a, int64_t b, int64_t c) {
   /* OF */ const uint8_t s_a = a < 0, s_b = b < 0, s_c = c < 0;
   if( (s_a == 0 && s_b == 0) || (s_a == 1 && s_b == 1) ) CLEAR_FLAG(RFLAGS_OF); 
@@ -881,6 +896,31 @@ static void exe_movs(uint8_t operand_sz, uint8_t addr_sz) {
   }
 }
 
+static void exe_stos(uint8_t operand_sz, uint8_t addr_sz) {
+  uint64_t dest_offset = 0;
+  memcpy(&dest_offset, get_reg_addr(RDI, addr_sz), addr_sz);
+  
+  uint8_t* src_addr  = get_reg_addr(RAX, operand_sz);
+  uint8_t* dest_addr = ram + get_flat_address(ES, dest_offset);
+  const int8_t dir   = GET_RFLAGS(RFLAGS_DF) ? -operand_sz : operand_sz;
+
+  if( prefixes.g1.present && prefixes.g1.prefix == 0xF3 ) {
+    while( 1 ) {
+      const uint64_t cx = read_unsigned(get_reg_addr(RCX, addr_sz), addr_sz);
+      if( cx == 0 ) break;
+
+      memcpy(dest_addr, src_addr, operand_sz);
+      cpu.rsi += dir;
+      src_addr += dir;
+      --(cpu.rcx);
+    }
+  }
+  else {
+    memcpy(dest_addr, src_addr, operand_sz);
+    cpu.rsi += dir;
+  }
+}
+
 static void exe_lods(uint8_t operand_sz, uint8_t addr_sz) {
   const SegmentRegister segment = overridable_segment(DS);
 
@@ -918,6 +958,24 @@ static void exe_shr(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b)
   
   if( b == 1 ) { UPDATE_FLAG(GET_MSB(a, dest_sz*8), RFLAGS_OF) }
   if( b > 0 ) {
+    update_sf_flag(c);
+    update_zf_flag(c);
+    update_pf_flag(c);
+  }
+}
+
+static void exe_shrd(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
+  uint64_t c = a;
+  for(uint64_t i = 0; i < cpu.cl; ++i) {
+    UPDATE_FLAG(c & 0x1, RFLAGS_CF)
+    c >>= 1;
+    c |= (b & 0x1) << (dest_sz*8 - 1);
+    b >>= 1;
+  }
+  memcpy(dest_addr, &c, dest_sz);
+  
+  if( cpu.cl == 1 ) { UPDATE_FLAG(GET_MSB(a, dest_sz*8) ^ GET_MSB(c, dest_sz*8), RFLAGS_OF) }
+  if( cpu.cl > 0 ) {
     update_sf_flag(c);
     update_zf_flag(c);
     update_pf_flag(c);
@@ -1018,6 +1076,20 @@ static void exe_inc(uint8_t* dest_addr, uint8_t dest_sz) {
   /* PF */ update_pf_flag(c);
 }
 
+static void exe_dec(uint8_t* dest_addr, uint8_t dest_sz) {
+  int64_t a = read_signed(dest_addr, dest_sz);
+  int64_t c = a - 1;
+  memcpy(dest_addr, &c, dest_sz);
+
+  /* OF */ const uint8_t s_a = a < 0, s_c = c < 0;
+  if( s_a == 0 ) CLEAR_FLAG(RFLAGS_OF); 
+  if( s_a == 1 ) { UPDATE_FLAG(s_c == 0, RFLAGS_OF) }
+  /* SF */ update_sf_flag(c);
+  /* ZF */ update_zf_flag(c);
+  /* AF */ UPDATE_FLAG( ((uint64_t)a & 0x0F) < 1, RFLAGS_AF)
+  /* PF */ update_pf_flag(c);
+}
+
 static void exe_loop(uint8_t addr_sz, int64_t disp) {
   --(cpu.rcx);
   const uint64_t cx = read_unsigned(get_reg_addr(RCX, addr_sz), addr_sz);
@@ -1084,6 +1156,18 @@ static void decode_one_byte_opcode(String assembly) {
       exe_or(dest_addr, 1, a, b);
       return;
     }
+    case 0x0D: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      const uint8_t disp_sz = MIN(operand_sz, 4);
+      const uint64_t a = read_unsigned(get_reg_addr(RAX, operand_sz), operand_sz);
+      const uint64_t b = read_signed(opcode+1, disp_sz);
+      cpu.rip += 1 + disp_sz;
+
+      snprintf(str, len, "OR  %s, 0x%lx", get_reg_str(RAX, operand_sz),
+                                          b & (((uint64_t)1 << operand_sz*8) - 1));
+      exe_or(get_reg_addr(RAX, operand_sz), operand_sz, a, b);
+      return;
+    }
     case 0x10:
     case 0x11:
     case 0x12:
@@ -1132,6 +1216,18 @@ static void decode_one_byte_opcode(String assembly) {
       uint16_t segment;
       exe_pop(&segment, 2);
       set_seg_reg(DS, segment);
+      return;
+    }
+    case 0x25: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      const uint8_t disp_sz = MIN(operand_sz, 4);
+      const uint64_t a = read_unsigned(get_reg_addr(RAX, operand_sz), operand_sz);
+      const uint64_t b = read_signed(opcode+1, disp_sz);
+      cpu.rip += 1 + disp_sz;
+
+      snprintf(str, len, "AND  %s, 0x%lx", get_reg_str(RAX, operand_sz),
+                                           b & (((uint64_t)1 << operand_sz*8) - 1));
+      exe_and(get_reg_addr(RAX, operand_sz), operand_sz, a, b);
       return;
     }
     case 0x28:
@@ -1210,6 +1306,22 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "INC  %s", get_reg_str(opcode_reg, operand_sz));
       exe_inc(get_reg_addr(opcode_reg, operand_sz), operand_sz);
+      return;
+    }
+    case 0x48:
+    case 0x49:
+    case 0x4A:
+    case 0x4B:
+    case 0x4C:
+    case 0x4D:
+    case 0x4E:
+    case 0x4F: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
+      const uint8_t opcode_reg = read_reg_in_opcode(opcode);
+      ++(cpu.rip);
+
+      snprintf(str, len, "DEC  %s", get_reg_str(opcode_reg, operand_sz));
+      exe_dec(get_reg_addr(opcode_reg, operand_sz), operand_sz);
       return;
     }
     case 0x50:
@@ -1305,14 +1417,24 @@ static void decode_one_byte_opcode(String assembly) {
       const uint8_t operand_sz = rex_ext_operand_sz();
       MODRM(dest_addr);
 
-      int64_t a = read_signed(dest_addr, operand_sz);
-      int64_t b = read_signed(post_modrm, 1);
+      const int64_t a = read_signed(dest_addr, operand_sz);
+      const int64_t b = read_signed(post_modrm, 1);
       ++(cpu.rip);
 
       switch( info.reg ) {
         case 0: {
           snprintf(str, len, "ADD  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
           exe_add(dest_addr, operand_sz, a, b);
+          return;
+        }
+        case 1: {
+          snprintf(str, len, "OR  %s, 0x%lx", modrm.str, (uint64_t)b & 0xFF);
+          exe_or(dest_addr, operand_sz, a, b);
+          return;
+        }
+        case 2: {
+          snprintf(str, len, "ADC  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
+          exe_add(dest_addr, operand_sz, a, b + GET_RFLAGS(RFLAGS_CF));
           return;
         }
         case 5: {
@@ -1393,6 +1515,19 @@ static void decode_one_byte_opcode(String assembly) {
         }
       }
     }
+    case 0x9A: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      const uint64_t segment = read_unsigned(opcode+1+operand_sz, 2);
+      const uint64_t offset  = read_unsigned(opcode+1, operand_sz);
+      cpu.rip += 1 + operand_sz + 2;
+      
+      snprintf(str, len, "CALL  0x%lx:0x%lx", segment, offset);
+      exe_push(seg_reg_addr[CS], 2);
+      exe_push(get_ip_addr_from_size(operand_sz), operand_sz);
+      set_seg_reg(CS, segment);
+      cpu.rip = offset;
+      return;
+    }
     case 0x9D: {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
       ++(cpu.rip);
@@ -1443,6 +1578,20 @@ static void decode_one_byte_opcode(String assembly) {
                                                        get_reg_str(RSI, addr_sz));
       ++(cpu.rip);
       exe_movs(operand_sz, addr_sz);
+      return;
+    }
+    case 0xAA:
+    case 0xAB: {
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
+      const uint8_t addr_sz = address_sz();
+
+      snprintf(str, len, "%sSTOS%c  es:[%s], %s", rep_prefix_str(),
+                                                  get_str_inst_letter(operand_sz),
+                                                  get_reg_str(RDI, addr_sz),
+                                                  get_reg_str(RAX, operand_sz));
+      ++(cpu.rip);
+      exe_stos(operand_sz, addr_sz);
       return;
     }
     case 0xAC:
@@ -1549,6 +1698,27 @@ static void decode_one_byte_opcode(String assembly) {
       exe_int(imm);
       return;
     }
+    case 0xD3: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(dest_addr);
+
+      uint64_t a = read_unsigned(dest_addr, operand_sz);
+      uint64_t b = cpu.cl;
+      if( operand_sz == 8 ) { b &= 0x3F; } else { b &= 0x1F; }
+
+      switch( info.reg ) {
+        case 4: {
+          snprintf(str, len, "SHL  %s, cl", modrm.str); 
+          exe_shl(dest_addr, operand_sz, a, b);
+          return;
+        }
+        case 5: {
+          snprintf(str, len, "SHR  %s, cl", modrm.str); 
+          exe_shr(dest_addr, operand_sz, a, b);
+          return;
+        }
+      }
+    }
     case 0xE2: {
       const int64_t disp = read_signed(opcode+1, 1);
       cpu.rip += 2;
@@ -1612,6 +1782,21 @@ static void decode_one_byte_opcode(String assembly) {
       exe_jmp_rel(disp);
       return;
     }
+    case 0xF6: {
+      const uint8_t operand_sz = 1;
+      MODRM(dest_addr);
+      const uint64_t a = read_unsigned(dest_addr, 1);
+      const uint64_t b = read_unsigned(post_modrm, 1);
+      ++(cpu.rip);
+
+      switch( info.reg ) {
+        case 0: {
+          snprintf(str, len, "TEST  %s, 0x%lx", modrm.str, b);
+          exe_test(a, b);
+          return;
+        }
+      }
+    }
     case 0xF7: {
       const uint8_t operand_sz = rex_ext_operand_sz();
       MODRM(src_addr);
@@ -1663,8 +1848,9 @@ static void exe_cpuid(void) {
       // EAX = extended processor signature and feature bits (???)
       // EBX = reserved
       // ECX = some shit
-      // EDX = some shit + bit 29: is 64-bit mode available (important)
-      cpu.edx = 1 << 29;
+      // EDX = some shit + bit 26: 1GB pages available
+      //                 + bit 29: 64-bit mode available
+      cpu.edx = (1 << 29) | (1 << 26);
       break;
     }
   }
@@ -1722,7 +1908,7 @@ static uint64_t* get_ctrl_reg_addr(uint8_t index) {
   if( prefixes.rex.present )
     index |= prefixes.rex.r << 3;
   
-  if( index > 3 )
+  if( index > 4 )
     panic("cr5 and up are not implemented!");
 
   return ctrl_reg_addr[index];
@@ -1748,6 +1934,16 @@ static void decode_two_byte_opcode(String assembly) {
         }
       }
     }
+    case 0x20: {
+      const uint8_t operand_sz = four_or_eight_operand_sz();
+      MODRM(dest_addr);
+      if( info.mode == INDIRECT )
+        panic("Wait, that's illegal! Indirect memory addressing with 0F 20 is not allowed.");
+
+      snprintf(str, len, "MOV  %s, %s", modrm.str, get_ctrl_reg_str(info.reg));
+      exe_mov(dest_addr, get_ctrl_reg_addr(info.reg), operand_sz);
+      return;
+    }
     case 0x22: {
       const uint8_t operand_sz = four_or_eight_operand_sz();
       MODRM(src_addr);
@@ -1758,11 +1954,31 @@ static void decode_two_byte_opcode(String assembly) {
       exe_mov(get_ctrl_reg_addr(info.reg), src_addr, operand_sz);
       return;
     }
+    case 0x30: {
+      ++(cpu.rip);
+
+      snprintf(str, len, "WRMSR");
+      if( cpu.ecx == 0xC0000080 )
+        cpu.IA32_EFER = ((uint64_t)cpu.edx << 32) | (cpu.eax);
+      return;
+    }
     case 0xA2: {
       ++(cpu.rip);
       
       snprintf(str, len, "CPUID");
       exe_cpuid();
+      return;
+    }
+    case 0xAD: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(dest_addr);
+
+      uint64_t a = read_unsigned(dest_addr, operand_sz);
+      uint64_t b = read_unsigned(get_reg_addr(info.reg, operand_sz), operand_sz);
+      if( operand_sz == 8 ) { b &= 0x3F; } else { b &= 0x1F; }
+
+      snprintf(str, len, "SHRD  %s, %s, cl", modrm.str, get_reg_str(info.reg, operand_sz)); 
+      exe_shrd(dest_addr, operand_sz, a, b);
       return;
     }
     case 0xBA: {

@@ -132,6 +132,36 @@ static void load_bootloader_into_ram(void) {
   memcpy(ram + load_segment * 16, disk + bootloader_ptr, sector_count * 2048);
 }
 
+// Thanks to https://wiki.osdev.org/BIOS32 
+static void setup_BIOS32(void) {
+  uint8_t* BIOS32_ptr = ram + 0xE0000;
+  const uint32_t signature = 0x5F32335F;
+  const uint32_t entry_point = 0x0E0010; // We'll catch far calls to there
+  const uint64_t zero = 0;
+  const uint8_t len = 1;
+  const uint8_t checksum = 0xBE; // trust
+  
+  // --- ASM ---
+  // mov ebx, PCI_BASE_ADDR
+  // mov edx, PCI_OFFSET
+  // mov al, 0
+  // retf
+  uint8_t bios_proc[] = "\xBB\x00\x00\x00\x00\xBA\x00\x00\x00\x00\xB0\x00\xCB"; 
+  const uint32_t PCI_BASE_ADDR = 0;
+  const uint32_t PCI_OFFSET = 0;
+
+  memcpy(BIOS32_ptr, &signature, 4);
+  memcpy(BIOS32_ptr + 4, &entry_point, 4);
+  memcpy(BIOS32_ptr + 8, &zero, 1);
+  memcpy(BIOS32_ptr + 9, &len, 1);
+  memcpy(BIOS32_ptr + 10, &checksum, 1);
+  memcpy(BIOS32_ptr + 11, &zero, 5);
+
+  memcpy(BIOS32_ptr + 16, bios_proc, sizeof(bios_proc));
+  memcpy(BIOS32_ptr + 17, &PCI_BASE_ADDR, 4);
+  memcpy(BIOS32_ptr + 22, &PCI_OFFSET, 4);
+}
+
 // ************ //
 // **   UI   ** //
 // ************ //
@@ -224,8 +254,22 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 15, 26, "DF:%lu", GET_RFLAGS(RFLAGS_DF));
   mvwprintw(win, 16, 26, "OF:%lu", GET_RFLAGS(RFLAGS_OF));
 
-  mvwprintw(win, 8, 33, "CR0");
-  mvwprintw(win, 9, 33, "PE:%lu", GET_CR0(CR0_PE));
+  mvwprintw(win, 8,  33, "CR0");
+  mvwprintw(win, 9,  33, "PE:%lu", GET_CR0(CR0_PE));
+  mvwprintw(win, 10, 33, "ET:%lu", GET_CR0(CR0_ET));
+  mvwprintw(win, 11, 33, "NE:%lu", GET_CR0(CR0_NE));
+  mvwprintw(win, 12, 33, "PG:%lu", GET_CR0(CR0_PG));
+
+  mvwprintw(win, 8,  44, "CR3");
+  mvwprintw(win, 9,  44, "ADR:%014lx", cpu.cr3 & 0xFFFFFFFFFFFFF000);
+
+  mvwprintw(win, 8,  38, "CR4");
+  mvwprintw(win, 9,  38, "PSE:%lu", GET_CR4(CR4_PSE));
+  mvwprintw(win, 10, 38, "PAE:%lu", GET_CR4(CR4_PAE));
+  mvwprintw(win, 11, 38, "PGE:%lu", GET_CR4(CR4_PGE));
+
+  mvwprintw(win, 14, 33, "EFER");
+  mvwprintw(win, 15, 33, "LME:%lu", GET_EFER(EFER_LME));
 
   mvwprintw(win, 4, 35, "gdtr: %04x:%016lx", cpu.gdtr.limit, cpu.gdtr.base);
   mvwprintw(win, 5, 35, "idtr: %04x:%016lx", cpu.idtr.limit, cpu.idtr.base);
@@ -277,6 +321,7 @@ int32_t main(void) {
   init_disk();
   init_cpu();
 
+  setup_BIOS32();
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
   load_bootloader_into_ram();
 
