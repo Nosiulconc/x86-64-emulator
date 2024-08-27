@@ -8,6 +8,24 @@ extern void panic(const char* msg);
 
 typedef enum { REAL_MODE, PROTECTED_MODE, LONG_MODE } OperationMode;
 
+typedef float       f32_t;
+typedef double      f64_t;
+typedef long double f80_t;
+
+typedef struct {
+  uint16_t status, control, tags;
+
+  uint8_t r0[10];
+  uint8_t r1[10];
+  uint8_t r2[10];
+  uint8_t r3[10];
+  uint8_t r4[10];
+  uint8_t r5[10];
+  uint8_t r6[10];
+  uint8_t r7[10]; 
+}
+x87_FPU;
+
 typedef struct {
   uint64_t base_addr;
   uint8_t db : 1;
@@ -48,7 +66,7 @@ typedef struct {
   uint16_t tr;
 
   uint64_t cr0, cr1, cr2, cr3, cr4;
-  uint64_t IA32_EFER;
+  uint64_t IA32_EFER, IA32_FS_BASE, IA32_GS_BASE;
 
   uint8_t io_ports[65536];
 }
@@ -77,6 +95,9 @@ x64_CPU;
 extern OperationMode op_mode;
 extern x64_CPU cpu;
 extern uint8_t* ram;
+
+extern uint64_t phyaddr;
+extern char* phyaddr_seg;
 
 void cpu_operation_mode_transition(void) {
   switch( op_mode ) {
@@ -149,6 +170,9 @@ void init_cpu(void) {
   cpu.r15        = 0x0;
 
   cpu.IA32_EFER  = 0x0;
+  
+  cpu.IA32_FS_BASE = 0x0;
+  cpu.IA32_GS_BASE = 0x0;
 }
 
 uint64_t get_segment_descriptor(uint64_t segment) {
@@ -181,46 +205,68 @@ static void set_seg_reg(SegmentRegister seg_reg, uint64_t segment) {
 }
 
 uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
+  if( seg_reg != CS )
+    phyaddr_seg = seg_reg_str[seg_reg];
+
   if( cpu.cr0 & CR0_PG ) {
     if( op_mode != LONG_MODE )
       panic("Paging is only supported in long mode!");
     // pagingmaxxing
     if( cpu.cs_cache.l ) {
+      uint64_t linear_addr;
+      switch( seg_reg ) {
+        case FS: linear_addr = cpu.IA32_FS_BASE; break;
+        case GS: linear_addr = cpu.IA32_GS_BASE; break;
+        default: linear_addr = 0; break;
+      }
+      linear_addr += offset;
+
       const uint64_t pml4_addr = cpu.cr3 & 0x000FFFFFFFFFF000;
-      const uint64_t pml4e_index = (offset >> 39) & 0x1FF;
+      const uint64_t pml4e_index = (linear_addr >> 39) & 0x1FF;
       const uint64_t pml4e = *(uint64_t*)(ram + pml4_addr + pml4e_index*8);
 
       const uint64_t pdpt_addr = pml4e & 0x000FFFFFFFFFF000;
-      const uint64_t pdpte_index = (offset >> 30) & 0x1FF;
+      const uint64_t pdpte_index = (linear_addr >> 30) & 0x1FF;
       const uint64_t pdpte = *(uint64_t*)(ram + pdpt_addr + pdpte_index*8);
 
       if( (pdpte >> 7) & 0x1 )
         panic("No support for 1 GB pages!");
       const uint64_t pd_addr = pdpte & 0x000FFFFFFFFFF000;
-      const uint64_t pde_index = (offset >> 21) & 0x1FF;
+      const uint64_t pde_index = (linear_addr >> 21) & 0x1FF;
       const uint64_t pde = *(uint64_t*)(ram + pd_addr + pde_index*8);
 
       if( (pde >> 7) & 0x1 ) {
         // 2 MB page
         const uint64_t page_addr = pde & 0x000FFFFFFFF00000;
-        const uint64_t page_index = offset & 0x1FFFFF;
-        return page_addr + page_index;
-      }
+        const uint64_t page_index = linear_addr & 0x1FFFFF;
 
+        if( seg_reg == CS )
+          return page_addr + page_index;
+        phyaddr = page_addr + page_index;
+        return phyaddr;
+      }
+      
       const uint64_t pt_addr = pde & 0x000FFFFFFFFFF000;
-      const uint64_t pte_index = (offset >> 12) & 0x1FF;
+      const uint64_t pte_index = (linear_addr >> 12) & 0x1FF;
       const uint64_t pte = *(uint64_t*)(ram + pt_addr + pte_index*8);
 
       const uint64_t page_addr = pte & 0x000FFFFFFFFFF000;
-      const uint64_t page_index = (offset >> 0) & 0xFFF;
-      return page_addr + page_index;
+      const uint64_t page_index = (linear_addr >> 0) & 0xFFF;
+
+      if( seg_reg == CS )
+        return page_addr + page_index;
+      phyaddr = page_addr + page_index;
+      return phyaddr;
     }
     else {
       // TODO figure y the farcall to long mode cs is accessed like there's no paging
 
       const uint64_t linear_addr = seg_reg_cache[seg_reg]->base_addr + offset;
-      return linear_addr;
-
+      if( seg_reg == CS )
+        return linear_addr;
+      phyaddr = linear_addr;
+      return phyaddr;
+      /*
       const uint64_t pdpt_addr = cpu.cr3 & 0x000FFFFFFFFFF000;
       const uint64_t pdpte_index = (linear_addr >> 30) & 0x2;
       const uint64_t pdpte = *(uint64_t*)(ram + pdpt_addr + pdpte_index*8);
@@ -240,9 +286,14 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
       const uint64_t page_addr = pte & 0x000FFFFFFFFFF000;
       const uint64_t page_index = (linear_addr >> 0) & 0xFFF;
       return page_addr + page_index;
+      */
     }
   }
-  return seg_reg_cache[seg_reg]->base_addr + offset;
+  const uint64_t linear_addr = seg_reg_cache[seg_reg]->base_addr + offset;
+  if( seg_reg == CS )
+    return linear_addr;
+  phyaddr = linear_addr;
+  return phyaddr;
 }
 
 uint64_t get_ip(void) {

@@ -22,6 +22,8 @@ x64_CPU cpu;
 OperationMode op_mode = REAL_MODE;
 uint64_t inst_counter;
 
+x87_FPU fpu;
+
 const uint64_t RAM_CAPACITY = 32000000;
 const uint64_t DISK_CAPACITY = 32000000;
 
@@ -168,6 +170,8 @@ static void setup_BIOS32(void) {
 
 char str[29] = "none";
 String assembly = { 28, str };
+uint64_t phyaddr = 0;
+char* phyaddr_seg = "--";
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
   uint8_t* rip = base_addr + get_flat_address(CS, get_ip());
@@ -195,13 +199,17 @@ static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t
 }
 
 static void draw_hexwin(WINDOW* win, int32_t width, int32_t height, uint8_t* base_addr, uint8_t* bytes) {
+  werase(win);
   box(win, 0, 0);
+  
   for(int32_t i = 1; i < width - 1; ++i) mvwprintw(win, height - 3, i, "-");
   draw_bytes(win, base_addr, bytes, bytes - base_addr);
+  wrefresh(win);
 }
 
 static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
   box(win, 0, 0);
+
   mvwprintw(win, 1,  (width - 8) / 2, "CONTROLS");
   mvwprintw(win, 3,  2, "q: quit");
   mvwprintw(win, 4,  2, "up: scroll down");
@@ -212,9 +220,11 @@ static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 9,  2, "j: jump to rip");
   mvwprintw(win, 10, 2, "e: execute/step");
   mvwprintw(win, 11, 2, "u: run until");
+  wrefresh(win);
 }
 
 static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
+  werase(win);
   box(win, 0, 0);
 
   mvwprintw(win, 1, 1, "rax: %08lx.%04x.%02hhx.%02hhx", cpu.rax >> 32, cpu.eax >> 16, cpu.ah, cpu.al);
@@ -271,18 +281,35 @@ static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 14, 33, "EFER");
   mvwprintw(win, 15, 33, "LME:%lu", GET_EFER(EFER_LME));
 
-  mvwprintw(win, 4, 35, "gdtr: %04x:%016lx", cpu.gdtr.limit, cpu.gdtr.base);
-  mvwprintw(win, 5, 35, "idtr: %04x:%016lx", cpu.idtr.limit, cpu.idtr.base);
+  mvwprintw(win, 17, 33, "FS_BASE: %016lx", cpu.IA32_FS_BASE);
+  mvwprintw(win, 18, 33, "GS_BASE: %016lx", cpu.IA32_GS_BASE);
+
+  mvwprintw(win, 5, 35, "gdtr: %04x:%016lx", cpu.gdtr.limit, cpu.gdtr.base);
+  mvwprintw(win, 6, 35, "idtr: %04x:%016lx", cpu.idtr.limit, cpu.idtr.base);
 
   wattron(win, A_REVERSE);
-  mvwprintw(win, 1, 35, "rip: %016lx", cpu.rip);
+  mvwprintw(win, 1, 35, "rip:%016lx", cpu.rip);
   mvwprintw(win, 2, 35, "%s", assembly.str);
+  mvwprintw(win, 3, 35, "phyaddr:%s:%016lx", phyaddr_seg, phyaddr);
   wattroff(win, A_REVERSE);
+  wrefresh(win);
+}
+
+static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
+  box(win, 0, 0);
+
+  const int32_t regs_x = 1 + (width - 2 - 28) / 2;
+  for(int32_t i = 7; i >= 0; --i) {
+    uint8_t tag = (fpu.tags >> (2*i)) & 0b11;
+    uint8_t* reg = fpu.r0 + (10*i);
+    mvwprintw(win, 8 - i, regs_x, "r%u: %04x%016lx  %u%u", i, *(uint16_t*)(reg+8), *(uint64_t*)reg, tag>>1, tag&1);
+  }
+  wrefresh(win);
 }
 
 WINDOW* telwin;
 const int32_t tel_width  = 32;
-const int32_t tel_height = 43;
+const int32_t tel_height = 22;
 int32_t telcur_x = 1, telcur_y = 1;
 
 void telwin_output(char c) {
@@ -295,7 +322,6 @@ void telwin_output(char c) {
     if( telcur_y >= tel_height - 1 )
       telcur_y = 1;
   }
-
   wrefresh(telwin);
 }
 
@@ -345,7 +371,6 @@ int32_t main(void) {
   wrefresh(stdwin);
 
   draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-  wrefresh(hexwin);
 
   // controls
   const int32_t ctrl_width  = 19;
@@ -354,16 +379,22 @@ int32_t main(void) {
   wrefresh(stdwin);
 
   draw_ctrlwin(ctrlwin, ctrl_width, ctrl_height);
-  wrefresh(ctrlwin);
 
-  // registers
+  // CPU registers
   const int32_t reg_width  = hex_width - ctrl_width;
   const int32_t reg_height = ctrl_height;
   WINDOW* regwin = newwin(reg_height, reg_width, hex_height, 0);
   wrefresh(stdwin);
 
   draw_regwin(regwin, reg_width, reg_height);
-  wrefresh(regwin);
+
+  // FPU registers
+  const int32_t fpu_width  = tel_width;
+  const int32_t fpu_height = ctrl_height;
+  WINDOW* fpuwin = newwin(fpu_height, fpu_width, hex_height, hex_width);
+  wrefresh(stdwin);
+
+  draw_fpuwin(fpuwin, fpu_width, fpu_height);
 
   // teletype
   telwin = newwin(tel_height, tel_width, 0, hex_width);
@@ -378,10 +409,8 @@ int32_t main(void) {
     decode_instruction(assembly);
 
   draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-  wrefresh(hexwin);
-  werase(regwin);
   draw_regwin(regwin, reg_width, reg_height);
-  wrefresh(regwin);
+  draw_fpuwin(fpuwin, fpu_width, fpu_height);
 
   int32_t c;
   while( (c = wgetch(stdwin)) != 'q' ) {
@@ -390,7 +419,6 @@ int32_t main(void) {
         if( hex_addr > hex_base_addr ) {
           hex_addr -= 16;
           draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-          wrefresh(hexwin);
         }
         break;
       }
@@ -398,7 +426,6 @@ int32_t main(void) {
         if( hex_addr + 256 < hex_base_addr + hex_buffer_size ) {
           hex_addr += 16;
           draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-          wrefresh(hexwin);
         }
         break;
       }
@@ -413,9 +440,7 @@ int32_t main(void) {
         hex_addr = hex_base_addr + seg;
 
       exit_goto_seg:
-        werase(hexwin);
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-        wrefresh(hexwin);
         break;
       }
       case 'j': {
@@ -423,7 +448,6 @@ int32_t main(void) {
         hex_addr = hex_base_addr + seg;
 
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-        wrefresh(hexwin);
         break;
       }
       case 'e': {
@@ -431,10 +455,8 @@ int32_t main(void) {
         ++inst_counter;
         
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-        wrefresh(hexwin);
-        werase(regwin);
         draw_regwin(regwin, reg_width, reg_height);
-        wrefresh(regwin);
+        draw_fpuwin(fpuwin, fpu_width, fpu_height);
         break;
       }
       case 's': {
@@ -452,12 +474,9 @@ int32_t main(void) {
         }
 
       exit_run_until:
-        werase(hexwin);
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-        wrefresh(hexwin);
-        werase(regwin);
         draw_regwin(regwin, reg_width, reg_height);
-        wrefresh(regwin);
+        draw_fpuwin(fpuwin, fpu_width, fpu_height);
         break;
       }
     }

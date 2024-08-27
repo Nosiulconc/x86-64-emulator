@@ -52,6 +52,8 @@ static InstructionPrefixes prefixes;
 
 extern OperationMode op_mode;
 extern x64_CPU cpu;
+extern x87_FPU fpu;
+extern uint64_t inst_counter;
 
 extern const uint64_t RAM_CAPACITY;
 extern const uint64_t DISK_CAPACITY;
@@ -155,7 +157,12 @@ static uint8_t not_rex_ext_operand_sz(void) {
 static uint8_t rex_ext_operand_sz(void) {
   switch( op_mode ) {
     case REAL_MODE: return prefixes.g3.present ? 4 : 2;
-    case LONG_MODE: if( prefixes.rex.present && prefixes.rex.w ) return 8;
+    case LONG_MODE: {
+      if( cpu.cs_cache.l ) {
+        if( prefixes.rex.present && prefixes.rex.w ) return 8;
+        return prefixes.g3.present ? 2 : 4;
+      }
+    }
     case PROTECTED_MODE: {
       uint8_t operand_sz = cpu.cs_cache.db ? 4 : 2;
       if( prefixes.g3.present ) operand_sz = 6 - operand_sz;
@@ -181,6 +188,14 @@ static uint8_t address_sz(void) {
       if( prefixes.g4.present ) addr_sz = 6 - addr_sz;
       return addr_sz;
     }
+  }
+}
+
+static uint8_t stack_address_sz(void) {
+  switch( op_mode ) {
+    case REAL_MODE:      return 2;
+    case LONG_MODE:      if( cpu.cs_cache.l ) return 8;
+    case PROTECTED_MODE: return cpu.ss_cache.db ? 4 : 2;
   }
 }
 
@@ -444,7 +459,7 @@ static void bios_interrupt_21(void) {
           // --- GET MEMORY SIZE FOR >64M CONFIGURATIONS ---
           SET_FLAG(RFLAGS_CF);
           cpu.cx = cpu.ax = 0x3C00; // There's 15 MB of memory after the initial 1 MB
-          cpu.dx = cpu.bx = (RAM_CAPACITY - 16000000) / 64000; // Number of 64K blocks after the 16MB
+          cpu.dx = cpu.bx = (RAM_CAPACITY - 16*1024*1024) / (64*1024); // Number of 64K blocks after the 16MB
           return;
         }
         case 0x20: {
@@ -458,8 +473,8 @@ static void bios_interrupt_21(void) {
           cpu.ebx = 0;
           uint8_t* SMM_ptr = ram + get_flat_address(ES, cpu.di);
           const uint64_t base_addr = 0;
-          const uint32_t mem_attributes = 0x00010001; // no reserved memory TODO: actually figure it out
-          memcpy(SMM_ptr, &base_addr, 8);
+          const uint32_t mem_attributes = 0x1; // All physical memory is accessible RAM
+          memcpy(SMM_ptr + 0, &base_addr, 8);
           memcpy(SMM_ptr + 8, &RAM_CAPACITY, 8);
           memcpy(SMM_ptr + 16, &mem_attributes, 4);
           return;
@@ -491,6 +506,10 @@ static char* overridable_segment_str(SegmentRegister seg_reg) {
 static SegmentRegister overridable_segment(SegmentRegister seg_reg) {
   if( !prefixes.g2.present ) return seg_reg;
   return seg_reg_from_prefix(prefixes.g2.prefix);
+}
+
+static uint8_t get_ext_opcode_in_modrm(uint8_t* modrm) {
+  return (*modrm & 0b00111000) >> 3;
 }
 
 char* real_mode_addr_modes[] = {"bx+si","bx+di","bp+si","bp+di","si","di","bp","bx"};
@@ -670,7 +689,7 @@ static void read_modrm(uint8_t operand_sz, uint8_t addr_sz, String modrm, ModRM_
             if( op_mode == LONG_MODE ) {
               const int64_t disp = read_signed(rip+1, 4);
               cpu.rip += 5; // always relative to the next instruction
-              snprintf(str, len, "[%s%c0x%lx]", get_ip_str_from_size(addr_sz), pos_neg[disp<0], disp);
+              snprintf(str, len, "[%s%c0x%lx]", get_ip_str_from_size(addr_sz), pos_neg[disp<0], ABS(disp));
               out->offset = get_ip_from_size(addr_sz) + disp;
               out->flat_addr = get_flat_address(segment, out->offset);
             }
@@ -704,7 +723,7 @@ static void read_modrm(uint8_t operand_sz, uint8_t addr_sz, String modrm, ModRM_
             read_sib(addr_sz, mod, sib, &info);
             const int64_t disp = read_signed(rip+2, disp_sz);
             cpu.rip += disp_sz;
-            snprintf(str, len, "[%s%c0x%lx]", sib.str, pos_neg[disp<0], disp);
+            snprintf(str, len, "[%s%c0x%lx]", sib.str, pos_neg[disp<0], ABS(disp));
             if( !segment_override ) segment = info.segment;
             out->mode = INDIRECT;
             out->offset = info.offset + disp;
@@ -715,7 +734,7 @@ static void read_modrm(uint8_t operand_sz, uint8_t addr_sz, String modrm, ModRM_
             rm |= prefixes.rex.b << 3;
           const int64_t disp = read_signed(rip+1, disp_sz);
           cpu.rip += 1 + disp_sz;
-          snprintf(str, len, "[%s%c0x%lx]", get_reg_str(rm, addr_sz), pos_neg[disp<0], disp);
+          snprintf(str, len, "[%s%c0x%lx]", get_reg_str(rm, addr_sz), pos_neg[disp<0], ABS(disp));
           if( !segment_override ) segment = protected_mode_default_segment(rm);
           out->mode = INDIRECT;
           uint64_t offset = 0;
@@ -806,6 +825,11 @@ static void exe_and(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b)
   /* ZF */ update_zf_flag(c);
   /* PF */ update_pf_flag(c);
   /* CF */ CLEAR_FLAG(RFLAGS_CF);
+}
+
+static void exe_not(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a) {
+  uint64_t c = ~a;
+  memcpy(dest_addr, &c, dest_sz);
 }
 
 static void update_sub_flags(int64_t a, int64_t b, int64_t c) {
@@ -910,14 +934,14 @@ static void exe_stos(uint8_t operand_sz, uint8_t addr_sz) {
       if( cx == 0 ) break;
 
       memcpy(dest_addr, src_addr, operand_sz);
-      cpu.rsi += dir;
+      cpu.rdi += dir;
       src_addr += dir;
       --(cpu.rcx);
     }
   }
   else {
     memcpy(dest_addr, src_addr, operand_sz);
-    cpu.rsi += dir;
+    cpu.rdi += dir;
   }
 }
 
@@ -1104,6 +1128,33 @@ static void exe_out(uint8_t* src_addr, uint8_t src_sz, uint16_t port) {
   memcpy(cpu.io_ports + port, src_addr, src_sz);
 }
 
+static void exe_fninit(void) {
+  fpu.status = 0;
+  fpu.control = 0x37F;
+  fpu.tags = 0xFFFF;
+}
+
+static void exe_fxsave64(uint8_t* dest_addr) {
+  memcpy(dest_addr + 0, &(fpu.control), 2);
+  memcpy(dest_addr + 2, &(fpu.status), 2);
+
+  uint8_t ftw = 0;
+  for(uint64_t i = 0; i < 8; ++i) {
+    const uint8_t tag = ((fpu.tags >> (2*i+1)) & 0x1) ^ 0x1; 
+    ftw |= tag << i;
+  }
+  memcpy(dest_addr + 4, &ftw, 1);
+
+  memcpy(dest_addr + 32, &(fpu.r0), 10);
+  memcpy(dest_addr + 48, &(fpu.r1), 10);
+  memcpy(dest_addr + 64, &(fpu.r2), 10);
+  memcpy(dest_addr + 80, &(fpu.r3), 10);
+  memcpy(dest_addr + 96, &(fpu.r4), 10);
+  memcpy(dest_addr + 112, &(fpu.r5), 10);
+  memcpy(dest_addr + 128, &(fpu.r6), 10);
+  memcpy(dest_addr + 144, &(fpu.r7), 10);
+}
+
 static void decode_one_byte_opcode(String assembly) {
   uint32_t len = assembly.len;
   char* str = assembly.str;
@@ -1140,10 +1191,12 @@ static void decode_one_byte_opcode(String assembly) {
       return;
     }
     case 0x06: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
+      const uint64_t es = read_unsigned(&(cpu.es), 2);
       ++(cpu.rip);
       
       snprintf(str, len, "PUSH  es");
-      exe_push(&(cpu.es), 2);
+      exe_push(&es, operand_sz);
       return;
     }
     case 0x0C: {
@@ -1203,23 +1256,45 @@ static void decode_one_byte_opcode(String assembly) {
       return;
     }
     case 0x1E: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
+      const uint64_t ds = read_unsigned(&(cpu.ds), 2);                
       ++(cpu.rip);
       
       snprintf(str, len, "PUSH  ds");
-      exe_push(&(cpu.ds), 2);
+      exe_push(&ds, operand_sz);
       return;
     }
     case 0x1F: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
       ++(cpu.rip);
       
       snprintf(str, len, "POP  ds");
-      uint16_t segment;
-      exe_pop(&segment, 2);
+      uint64_t segment = 0;
+      exe_pop(&segment, operand_sz);
       set_seg_reg(DS, segment);
       return;
     }
+    case 0x20:
+    case 0x21:
+    case 0x22:
+    case 0x23: {
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t d = (*opcode >> 1) & 0x1;
+      const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
+      char *src_str, *dest_str;
+      uint8_t *src_addr, *dest_addr;
+      decode_gpr_modrm(d, operand_sz, &src_str, &src_addr, &dest_str, &dest_addr);
+      const uint64_t a = read_unsigned(dest_addr, operand_sz);
+      const uint64_t b = read_unsigned(src_addr, operand_sz);
+
+      snprintf(str, len, "AND  %s, %s", dest_str, src_str);
+      exe_and(dest_addr, operand_sz, a, b);
+      return;
+    }
+    case 0x24:
     case 0x25: {
-      const uint8_t operand_sz = rex_ext_operand_sz();
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
       const uint8_t disp_sz = MIN(operand_sz, 4);
       const uint64_t a = read_unsigned(get_reg_addr(RAX, operand_sz), operand_sz);
       const uint64_t b = read_signed(opcode+1, disp_sz);
@@ -1358,8 +1433,18 @@ static void decode_one_byte_opcode(String assembly) {
     }
     case 0x68: {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
-      const uint64_t imm = read_unsigned(opcode+1, operand_sz);
-      cpu.rip += 1 + operand_sz;
+      const uint8_t imm_sz = MIN(operand_sz, 4);
+      const uint64_t imm = read_signed(opcode+1, imm_sz);
+      cpu.rip += 1 + imm_sz;
+
+      snprintf(str, len, "PUSH  0x%lx", imm);
+      exe_push(&imm, operand_sz);
+      return;
+    }
+    case 0x6A: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
+      const uint64_t imm = read_signed(opcode+1, 1);
+      cpu.rip += 2;
 
       snprintf(str, len, "PUSH  0x%lx", imm);
       exe_push(&imm, operand_sz);
@@ -1401,6 +1486,11 @@ static void decode_one_byte_opcode(String assembly) {
       cpu.rip += disp_sz;
 
       switch( info.reg ) {
+        case 0: {
+          snprintf(str, len, "ADD  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
+          exe_add(dest_addr, operand_sz, a, b);
+          return;
+        }
         case 5: {
           snprintf(str, len, "SUB  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
           exe_sub(dest_addr, operand_sz, a, b);
@@ -1411,6 +1501,7 @@ static void decode_one_byte_opcode(String assembly) {
           exe_cmp(a, b);
           return;
         }
+        default: panic("Subop of 0x81 not implemented!");
       }
     }
     case 0x83: {
@@ -1442,6 +1533,12 @@ static void decode_one_byte_opcode(String assembly) {
           exe_sub(dest_addr, operand_sz, a, b);
           return;
         }
+        case 7: {
+          snprintf(str, len, "CMP  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
+          exe_cmp(a, b);
+          return;
+        }
+        default: panic("Subop of 0x83 not implemented!");
       }
     }
     case 0x84:
@@ -1513,7 +1610,13 @@ static void decode_one_byte_opcode(String assembly) {
           exe_pop(dest_addr, operand_sz);
           return;
         }
+        default: panic("Subop of 0x8F not implemented!");
       }
+    }
+    case 0x90: {
+      ++(cpu.rip);
+      snprintf(str, len, "NOP");
+      return;
     }
     case 0x9A: {
       const uint8_t operand_sz = rex_ext_operand_sz();
@@ -1526,6 +1629,14 @@ static void decode_one_byte_opcode(String assembly) {
       exe_push(get_ip_addr_from_size(operand_sz), operand_sz);
       set_seg_reg(CS, segment);
       cpu.rip = offset;
+      return;
+    }
+    case 0x9C: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
+      ++(cpu.rip);
+
+      snprintf(str, len, "PUSHF%c", get_str_inst_letter(operand_sz));
+      exe_push(&(cpu.rflags), operand_sz);
       return;
     }
     case 0x9D: {
@@ -1662,12 +1773,37 @@ static void decode_one_byte_opcode(String assembly) {
           exe_shr(dest_addr, operand_sz, a, b);
           return;
         }
+        default: panic("Subop of 0xC1 not implemented!");
       }
+    }
+    case 0xC2: {
+      const uint64_t imm = read_unsigned(opcode+1, 2);
+
+      snprintf(str, len, "RET 0x%lx", imm);
+      exe_ret_near(not_rex_ext_operand_sz());
+      cpu.rsp += imm;
+      return;
     }
     case 0xC3: {
       snprintf(str, len, "RET");
       exe_ret_near(not_rex_ext_operand_sz());
       return;
+    }
+    case 0xC6: {
+      const uint8_t operand_sz = 1;
+      MODRM(dest_addr);
+
+      const int64_t imm = read_signed(post_modrm, 1);
+      cpu.rip += 1;
+
+      switch( info.reg ) {
+        case 0: {
+          snprintf(str, len, "MOV  %s, 0x%lx", modrm.str, imm & 0xFF);
+          exe_mov(dest_addr, post_modrm, operand_sz);
+          return;
+        }
+        default: panic("Subop of 0xC6 not implemented!");
+      }
     }
     case 0xC7: {
       const uint8_t operand_sz = rex_ext_operand_sz();
@@ -1683,7 +1819,18 @@ static void decode_one_byte_opcode(String assembly) {
           exe_mov(dest_addr, post_modrm, operand_sz);
           return;
         }
+        default: panic("Subop of 0xC7 not implemented!");
       }
+    }
+    case 0xC9: {
+      const uint8_t operand_sz = not_rex_ext_operand_sz();
+      const uint8_t stack_addr_sz = stack_address_sz();
+      ++(cpu.rip);
+
+      snprintf(str, len, "LEAVE");
+      memcpy(get_reg_addr(RSP, stack_addr_sz), get_reg_addr(RBP, stack_addr_sz), stack_addr_sz);
+      exe_pop(get_reg_addr(RBP, operand_sz), operand_sz);
+      return;
     }
     case 0xCB: {
       snprintf(str, len, "RET");
@@ -1697,6 +1844,21 @@ static void decode_one_byte_opcode(String assembly) {
       snprintf(str, len, "INT  0x%lx", imm);
       exe_int(imm);
       return;
+    }
+    case 0xD1: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(dest_addr);
+
+      uint64_t a = read_unsigned(dest_addr, operand_sz);
+
+      switch( info.reg ) {
+        case 4: {
+          snprintf(str, len, "SHL  %s, 0x1", modrm.str); 
+          exe_shl(dest_addr, operand_sz, a, 1);
+          return;
+        }
+        default: panic("Subop of 0xD1 not implemented!");
+      }
     }
     case 0xD3: {
       const uint8_t operand_sz = rex_ext_operand_sz();
@@ -1717,6 +1879,17 @@ static void decode_one_byte_opcode(String assembly) {
           exe_shr(dest_addr, operand_sz, a, b);
           return;
         }
+        default: panic("Subop of 0xD3 not implemented!");
+      }
+    }
+    case 0xDB: {
+      ++(cpu.rip);
+      if( *(opcode+1) == 0xE3 ) {
+        ++(cpu.rip);
+
+        snprintf(str, len, "FNINIT");
+        exe_fninit();
+        return;
       }
     }
     case 0xE2: {
@@ -1795,21 +1968,27 @@ static void decode_one_byte_opcode(String assembly) {
           exe_test(a, b);
           return;
         }
+        default: panic("Subop of 0xF6 not implemented!");
       }
     }
     case 0xF7: {
       const uint8_t operand_sz = rex_ext_operand_sz();
       MODRM(src_addr);
 
-      uint64_t src = 0;
-      memcpy(&src, src_addr, operand_sz);
+      const uint64_t a = read_unsigned(src_addr, operand_sz);
 
       switch( info.reg ) {
-        case 6: {
-          snprintf(str, len, "DIV  %s", modrm.str);
-          exe_div(operand_sz, src);
+        case 2: {
+          snprintf(str, len, "NOT  %s", modrm.str);
+          exe_not(src_addr, operand_sz, a);
           return;
         }
+        case 6: {
+          snprintf(str, len, "DIV  %s", modrm.str);
+          exe_div(operand_sz, a);
+          return;
+        }
+        default: panic("Subop of 0xF7 not implemented!");
       }
     }
     case 0xFA: {
@@ -1832,6 +2011,35 @@ static void decode_one_byte_opcode(String assembly) {
       snprintf(str, len, "CLD");
       CLEAR_FLAG(RFLAGS_DF);
       return;
+    }
+    case 0xFF: {
+      switch( get_ext_opcode_in_modrm(opcode+1) ) {
+        case 0: {
+          const uint8_t operand_sz = rex_ext_operand_sz();
+          MODRM(dest_addr);
+
+          snprintf(str, len, "INC  %s", modrm.str);
+          exe_inc(dest_addr, operand_sz);
+          return;
+        }
+        case 1: {
+          const uint8_t operand_sz = rex_ext_operand_sz();
+          MODRM(dest_addr);
+
+          snprintf(str, len, "DEC  %s", modrm.str);
+          exe_dec(dest_addr, operand_sz);
+          return;
+        }
+        case 6: {
+          const uint8_t operand_sz = not_rex_ext_operand_sz();
+          MODRM(dest_addr);
+
+          snprintf(str, len, "PUSH  %s", modrm.str);
+          exe_push(dest_addr, operand_sz);
+          return;
+        }
+        default: panic("Subop of 0xFF not implemented!");
+      }
     }
     default: panic("The 1 byte instruction was not implemented!");
   }
@@ -1863,7 +2071,14 @@ static void exe_bt(uint8_t* bit_base, uint8_t base_sz, uint64_t bit_offset, uint
 
   switch( ext_opcode ) {
     case 5: {
-      tmp |= 1 << bit_offset;
+      // BTS set bit
+      tmp |= (uint64_t)1 << bit_offset;
+      memcpy(bit_base, &tmp, base_sz);
+      break;
+    }
+    case 6: {
+      // BTR clear bit
+      tmp &= ~((uint64_t)1 << bit_offset);
       memcpy(bit_base, &tmp, base_sz);
       break;
     }
@@ -1891,6 +2106,15 @@ static void exe_lgdt(uint8_t* src_addr, uint8_t operand_sz) {
     }
   }
   cpu.gdtr.base = base_addr;
+}
+
+static void exe_bsr(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a) {
+  if( a ) {
+    uint64_t index = 63;
+    while( (a & ((uint64_t)1 << index)) == 0 ) --index;
+    memcpy(dest_addr, &index, dest_sz);
+  }
+  update_zf_flag(a);
 }
 
 char* ctrl_reg_str[] = {"cr0","cr1","cr2","cr3","cr4","cr5","cr6","cr7","cr8","cr9","cr10","cr11","cr12","cr13","cr14","cr15"};
@@ -1932,6 +2156,7 @@ static void decode_two_byte_opcode(String assembly) {
           exe_lgdt(src_addr, operand_sz);
           return;
         }
+        default: panic("Subop of 0x0F 0x01 not implemented!");
       }
     }
     case 0x20: {
@@ -1958,8 +2183,54 @@ static void decode_two_byte_opcode(String assembly) {
       ++(cpu.rip);
 
       snprintf(str, len, "WRMSR");
-      if( cpu.ecx == 0xC0000080 )
-        cpu.IA32_EFER = ((uint64_t)cpu.edx << 32) | (cpu.eax);
+      switch( cpu.ecx ) {
+        case 0xC0000080: {
+          cpu.IA32_EFER = ((uint64_t)cpu.edx << 32) | (cpu.eax);
+          return;
+        }
+        case 0xC0000100: {
+          cpu.IA32_FS_BASE = ((uint64_t)cpu.edx << 32) | (cpu.eax);
+          return;
+        }
+        case 0xC0000101: {
+          cpu.IA32_GS_BASE = ((uint64_t)cpu.edx << 32) | (cpu.eax);
+          return;
+        }
+        default: panic("Trying to write to unsupported MSR!");
+      }
+    }
+    case 0x31: {
+      ++(cpu.rip);
+      snprintf(str, len, "RDTSC");
+      cpu.eax = inst_counter & 0xFFFFFFFF;
+      cpu.edx = inst_counter >> 32;
+      return;
+    }
+    case 0x80:
+    case 0x81:
+    case 0x82:
+    case 0x83:
+    case 0x84:
+    case 0x85:
+    case 0x86:
+    case 0x87:
+    case 0x88:
+    case 0x89:
+    case 0x8A:
+    case 0x8B:
+    case 0x8C:
+    case 0x8D:
+    case 0x8E:
+    case 0x8F: {
+      const uint8_t disp_sz = MIN(rex_ext_operand_sz(), 4);
+      const uint8_t tttn   = *opcode & 0x0F;
+      const uint8_t flag   = (*opcode & 0b1110) >> 1;
+      const uint8_t negate = (*opcode & 0b0001) >> 0;
+      const int64_t disp = read_signed(opcode+1, disp_sz);
+      cpu.rip += 1 + disp_sz;
+
+      snprintf(str, len, "%s  %c0x%lx", jcc_str[tttn], pos_neg[disp<0], ABS(disp));
+      exe_jcc(flag, negate, disp);
       return;
     }
     case 0xA2: {
@@ -1981,6 +2252,38 @@ static void decode_two_byte_opcode(String assembly) {
       exe_shrd(dest_addr, operand_sz, a, b);
       return;
     }
+    case 0xAE: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(dest_addr);
+
+      switch( info.reg ) {
+        case 0: {
+          if( !(op_mode == LONG_MODE && cpu.cs_cache.l && prefixes.rex.present && prefixes.rex.w) )
+            panic("FXSAVE is only implemented in 64 bit mode with REX.W == 1!");
+
+          snprintf(str, len, "FXSAVE64  %s", modrm.str);
+          exe_fxsave64(dest_addr);
+          return;
+        }
+        default: panic("Subop of 0x0F 0xAE not implemented!");
+      }
+    }
+    case 0xB6: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
+      ++(cpu.rip);
+      read_modrm(1, address_sz(), modrm, &info);
+      
+      uint8_t* src_addr;
+      if( info.mode == INDIRECT )    src_addr = ram + info.flat_addr;
+      else if( info.mode == DIRECT ) src_addr = info.reg_addr;
+
+      const uint64_t src = read_unsigned(src_addr, 1);
+
+      snprintf(str, len, "MOVZX  %s, %s", get_reg_str(info.reg, operand_sz), modrm.str);
+      exe_mov(get_reg_addr(info.reg, operand_sz), &src, operand_sz);
+      return;
+    }
     case 0xBA: {
       const uint8_t operand_sz = rex_ext_operand_sz();
       MODRM(bit_base);
@@ -1990,12 +2293,23 @@ static void decode_two_byte_opcode(String assembly) {
 
       switch( info.reg ) {
         case 4:
-        case 5: {
+        case 5:
+        case 6: {
           snprintf(str, len, "BT%s  %s, 0x%lx", bt_inst_str[info.reg - 4], modrm.str, bit_offset);
           exe_bt(bit_base, operand_sz, bit_offset, info.reg);
           return;
         }
+        default: panic("Subop of 0x0F 0xBA not implemented!");
       }
+    }
+    case 0xBD: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(src_addr);
+      const uint64_t a = read_unsigned(src_addr, operand_sz);
+
+      snprintf(str, len, "BSR  %s, %s", get_reg_str(info.reg, operand_sz), modrm.str);
+      exe_bsr(get_reg_addr(info.reg, operand_sz), operand_sz, a);
+      return;
     }
     default: panic("The 2 byte instruction was not implemented!");
   }
