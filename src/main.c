@@ -304,6 +304,9 @@ static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
     uint8_t* reg = fpu.r0 + (10*i);
     mvwprintw(win, 8 - i, regs_x, "r%u: %04x%016lx  %u%u", i, *(uint16_t*)(reg+8), *(uint64_t*)reg, tag>>1, tag&1);
   }
+
+  mvwprintw(win, 10, 2, "TOP:%01hhx", GET_FPU_TOP);
+  mvwprintw(win, 10, 8, "%10.11Lf", *(f80_t*)(fpu.r0 + 10*GET_FPU_TOP));
   wrefresh(win);
 }
 

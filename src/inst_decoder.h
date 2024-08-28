@@ -24,6 +24,8 @@
 
 #define GET_MSB(val, size) ((val >> (size - 1)) & 0x1)
 
+#define GET_FPU_TOP ((fpu.status >> 11) & 0b111)
+
 #define MODRM(var)                                              \
   char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;    \
   ++(cpu.rip);                                                  \
@@ -174,6 +176,14 @@ static uint8_t rex_ext_operand_sz(void) {
 static uint8_t four_or_eight_operand_sz(void) {
   switch( op_mode ) {
     case REAL_MODE:
+    case PROTECTED_MODE: return 4;
+    case LONG_MODE:      return 8;
+  }
+}
+
+static uint8_t fpu_operand_sz(void) {
+  switch( op_mode ) {
+    case REAL_MODE:      return 2;
     case PROTECTED_MODE: return 4;
     case LONG_MODE:      return 8;
   }
@@ -512,6 +522,14 @@ static uint8_t get_ext_opcode_in_modrm(uint8_t* modrm) {
   return (*modrm & 0b00111000) >> 3;
 }
 
+static char* get_convert_inst_str(uint8_t operand_sz) {
+  switch( operand_sz ) {
+    case 2: return "CWD";
+    case 4: return "CDQ";
+    case 8: return "CQO";
+  }
+}
+
 char* real_mode_addr_modes[] = {"bx+si","bx+di","bp+si","bp+di","si","di","bp","bx"};
 
 char pos_neg[] = {'+','-'};
@@ -519,6 +537,7 @@ char pos_neg[] = {'+','-'};
 typedef enum { INDIRECT = 0, DIRECT = 1 } AddressingMode;
 
 typedef struct {
+  uint8_t ext_opcode;
   uint8_t reg;
   AddressingMode mode;
   union { uint64_t flat_addr; uint8_t* reg_addr; };
@@ -609,7 +628,7 @@ static void read_modrm(uint8_t operand_sz, uint8_t addr_sz, String modrm, ModRM_
 
   uint8_t mod = ((*rip) & 0b11000000) >> 6;
 
-  out->reg = ((*rip) & 0b00111000) >> 3;
+  out->ext_opcode = out->reg = ((*rip) & 0b00111000) >> 3;
   if( prefixes.rex.present )
     out->reg |= prefixes.rex.r << 3;
   
@@ -972,6 +991,24 @@ static void exe_lods(uint8_t operand_sz, uint8_t addr_sz) {
   }
 }
 
+static void exe_sar(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
+  uint64_t c = a;
+  const uint64_t sign = a & ((uint64_t)1 << (dest_sz*8 - 1));
+  for(uint64_t i = 0; i < b; ++i) {
+    UPDATE_FLAG(c & 0x1, RFLAGS_CF)
+    c >>= 1;
+    c |= sign;
+  }
+  memcpy(dest_addr, &c, dest_sz);
+  
+  if( b == 1 ) CLEAR_FLAG(RFLAGS_OF);
+  if( b > 0 ) {
+    update_sf_flag(c);
+    update_zf_flag(c);
+    update_pf_flag(c);
+  }
+}
+
 static void exe_shr(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
   uint64_t c = a;
   for(uint64_t i = 0; i < b; ++i) {
@@ -1053,27 +1090,62 @@ static void exe_jmp_rel(int64_t disp) {
   cpu.rip += disp;
 }
 
+static void exe_imul(uint8_t operand_sz, int64_t a, int64_t b) {
+  if( operand_sz != 8 )
+    panic("IMUL only implemented in 64-bit mode!");
+
+  switch( operand_sz ) {
+    case 8: {
+      const __int128 r = (__int128)a * (__int128)b;
+      cpu.rax = r & 0xFFFFFFFFFFFFFFFF;
+      cpu.rdx = r >> 64;
+      const uint8_t tmp = (__int128)((int64_t)(r & 0xFFFFFFFFFFFFFFFF)) != r;
+      UPDATE_FLAG(tmp, RFLAGS_CF);
+      UPDATE_FLAG(tmp, RFLAGS_OF);
+      return;
+    }
+  }
+}
+
 static void exe_div(uint8_t operand_sz, uint64_t divisor) {
   if( operand_sz == 8 )
-    panic("div in 64-bit mode not implemented!");
+    panic("DIV in 64-bit mode not implemented!");
+  if( divisor == 0 )
+    panic("Can't divide by 0!");
 
   switch( operand_sz ) {
     case 1: {
-      uint64_t dividend = cpu.ax;
+      const uint64_t dividend = cpu.ax;
       cpu.al = dividend / divisor;
       cpu.ah = dividend % divisor;
       return;
     }
     case 2: {
-      uint64_t dividend = ((uint64_t)cpu.dx << 16) | cpu.ax;
+      const uint64_t dividend = ((uint64_t)cpu.dx << 16) | cpu.ax;
       cpu.ax = dividend / divisor;
       cpu.dx = dividend % divisor;
       return;
     }
     case 4: {
-      uint64_t dividend = ((uint64_t)cpu.edx << 32) | cpu.eax;
+      const uint64_t dividend = ((uint64_t)cpu.edx << 32) | cpu.eax;
       cpu.eax = dividend / divisor;
       cpu.edx = dividend % divisor;
+      return;
+    }
+  }
+}
+
+static void exe_idiv(uint8_t operand_sz, int64_t divisor) {
+  if( operand_sz != 8 )
+    panic("IDIV only implemented in 64-bit mode!");
+  if( divisor == 0 )
+    panic("Can't divide by 0!");
+
+  switch( operand_sz ) {
+    case 8: {
+      const __int128 dividend = ((unsigned __int128)cpu.rdx << 64) | cpu.rax;
+      cpu.rax = dividend / (__int128)divisor;
+      cpu.rdx = dividend % (__int128)divisor;
       return;
     }
   }
@@ -1155,6 +1227,39 @@ static void exe_fxsave64(uint8_t* dest_addr) {
   memcpy(dest_addr + 144, &(fpu.r7), 10);
 }
 
+static void exe_convert(uint8_t operand_sz) {
+  const uint8_t sign = read_signed(get_reg_addr(RAX, operand_sz), operand_sz) < 0;
+  const uint64_t rdx[] = { 0x0000000000000000, 0xFFFFFFFFFFFFFFFF };
+  memcpy(get_reg_addr(RDX, operand_sz), rdx + sign, operand_sz);
+}
+
+static void exe_load_fpu(f80_t src) {
+  const uint16_t top = (GET_FPU_TOP - 1) & 0b111;
+  fpu.status &= 0b1100011111111111;
+  fpu.status |= top << 11;
+
+  const uint8_t* src_addr = &src;
+  memcpy(fpu.r0 + 10*top, src_addr, 10);
+  fpu.tags &= ~((uint16_t)0b11 << (2*top));
+  fpu.tags |= (uint16_t)(src == 0 ? 0b01 : 0b00) << (2*top);
+}
+
+static void exe_store_fpu(uint8_t* dest_addr, uint8_t dest_sz) {
+  const f80_t st0 = *(f80_t*)(fpu.r0 + 10*GET_FPU_TOP);
+  uint8_t* src_addr;
+  switch( dest_sz ) {
+    case 4:  { const f32_t src = st0; src_addr = &src; break; }
+    case 8:  { const f64_t src = st0; src_addr = &src; break; }
+    case 10: { const f80_t src = st0; src_addr = &src; break; }
+  }
+  memcpy(dest_addr, src_addr, dest_sz);
+  fpu.tags |= (uint16_t)0b11 << (2*GET_FPU_TOP);
+
+  const uint16_t top = (GET_FPU_TOP + 1) & 0b111;
+  fpu.status &= 0b1100011111111111;
+  fpu.status |= top << 11;
+}
+
 static void decode_one_byte_opcode(String assembly) {
   uint32_t len = assembly.len;
   char* str = assembly.str;
@@ -1178,8 +1283,10 @@ static void decode_one_byte_opcode(String assembly) {
       exe_add(dest_addr, operand_sz, a, b);
       return;
     }
+    case 0x04:
     case 0x05: {
-      const uint8_t operand_sz = rex_ext_operand_sz();
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
       const uint8_t disp_sz = MIN(operand_sz, 4);
       uint8_t* dest_addr = get_reg_addr(RAX, operand_sz);
       const int64_t a = read_signed(dest_addr, operand_sz);
@@ -1235,6 +1342,20 @@ static void decode_one_byte_opcode(String assembly) {
       const int64_t b = read_signed(src_addr, operand_sz) + GET_RFLAGS(RFLAGS_CF);
 
       snprintf(str, len, "ADC  %s, %s", dest_str, src_str);
+      exe_add(dest_addr, operand_sz, a, b);
+      return;
+    }
+    case 0x14:
+    case 0x15: {
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
+      const uint8_t disp_sz = MIN(operand_sz, 4);
+      uint8_t* dest_addr = get_reg_addr(RAX, operand_sz);
+      const int64_t a = read_signed(dest_addr, operand_sz);
+      const int64_t b = read_signed(opcode+1, disp_sz) + GET_RFLAGS(RFLAGS_CF);
+      cpu.rip += 1 + disp_sz;
+
+      snprintf(str, len, "ADC  %s, %c0x%lx", get_reg_str(RAX, operand_sz), pos_neg[b<0], ABS(b));
       exe_add(dest_addr, operand_sz, a, b);
       return;
     }
@@ -1441,6 +1562,21 @@ static void decode_one_byte_opcode(String assembly) {
       exe_push(&imm, operand_sz);
       return;
     }
+    case 0x69: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      const uint8_t imm_sz = MIN(operand_sz, 4);
+      MODRM(src_addr);
+      const int64_t a = read_signed(src_addr, operand_sz);
+      const int64_t b = read_signed(post_modrm, imm_sz);
+      cpu.rip += imm_sz;
+
+      snprintf(str, len, "IMUL  %s, %s, %c0x%lx", get_reg_str(info.reg, operand_sz),
+                                                  modrm.str,
+                                                  pos_neg[b<0],
+                                                  ABS(b));
+      exe_imul(operand_sz, a, b);
+      return;
+    }
     case 0x6A: {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
       const uint64_t imm = read_signed(opcode+1, 1);
@@ -1476,6 +1612,23 @@ static void decode_one_byte_opcode(String assembly) {
       exe_jcc(flag, negate, disp);
       return;
     }
+    case 0x80: {
+      const uint8_t operand_sz = 1;
+      MODRM(dest_addr);
+
+      int64_t a = read_signed(dest_addr, 1);
+      int64_t b = read_signed(post_modrm, 1);
+      ++(cpu.rip);
+
+      switch( info.ext_opcode ) {
+        case 7: {
+          snprintf(str, len, "CMP  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
+          exe_cmp(a, b);
+          return;
+        }
+        default: panic("Subop of 0x80 not implemented!");
+      }
+    }
     case 0x81: {
       const uint8_t operand_sz = rex_ext_operand_sz();
       MODRM(dest_addr);
@@ -1485,7 +1638,7 @@ static void decode_one_byte_opcode(String assembly) {
       int64_t b = read_signed(post_modrm, disp_sz);
       cpu.rip += disp_sz;
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 0: {
           snprintf(str, len, "ADD  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
           exe_add(dest_addr, operand_sz, a, b);
@@ -1512,7 +1665,7 @@ static void decode_one_byte_opcode(String assembly) {
       const int64_t b = read_signed(post_modrm, 1);
       ++(cpu.rip);
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 0: {
           snprintf(str, len, "ADD  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
           exe_add(dest_addr, operand_sz, a, b);
@@ -1604,7 +1757,7 @@ static void decode_one_byte_opcode(String assembly) {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
       MODRM(dest_addr);
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 0: {
           snprintf(str, len, "POP  %s", modrm.str);
           exe_pop(dest_addr, operand_sz);
@@ -1616,6 +1769,14 @@ static void decode_one_byte_opcode(String assembly) {
     case 0x90: {
       ++(cpu.rip);
       snprintf(str, len, "NOP");
+      return;
+    }
+    case 0x99: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      ++(cpu.rip);
+
+      snprintf(str, len, "%s", get_convert_inst_str(operand_sz));
+      exe_convert(operand_sz);
       return;
     }
     case 0x9A: {
@@ -1762,7 +1923,7 @@ static void decode_one_byte_opcode(String assembly) {
       if( operand_sz == 8 ) { b &= 0x3F; } else { b &= 0x1F; }
       ++(cpu.rip);
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 4: {
           snprintf(str, len, "SHL  %s, 0x%lx", modrm.str, b); 
           exe_shl(dest_addr, operand_sz, a, b);
@@ -1771,6 +1932,11 @@ static void decode_one_byte_opcode(String assembly) {
         case 5: {
           snprintf(str, len, "SHR  %s, 0x%lx", modrm.str, b); 
           exe_shr(dest_addr, operand_sz, a, b);
+          return;
+        }
+        case 7: {
+          snprintf(str, len, "SAR  %s, 0x%lx", modrm.str, b); 
+          exe_sar(dest_addr, operand_sz, a, b);
           return;
         }
         default: panic("Subop of 0xC1 not implemented!");
@@ -1793,13 +1959,13 @@ static void decode_one_byte_opcode(String assembly) {
       const uint8_t operand_sz = 1;
       MODRM(dest_addr);
 
-      const int64_t imm = read_signed(post_modrm, 1);
+      const uint64_t imm = read_signed(post_modrm, 1);
       cpu.rip += 1;
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 0: {
           snprintf(str, len, "MOV  %s, 0x%lx", modrm.str, imm & 0xFF);
-          exe_mov(dest_addr, post_modrm, operand_sz);
+          exe_mov(dest_addr, &imm, operand_sz);
           return;
         }
         default: panic("Subop of 0xC6 not implemented!");
@@ -1810,13 +1976,13 @@ static void decode_one_byte_opcode(String assembly) {
       MODRM(dest_addr);
 
       const uint8_t imm_sz = MIN(operand_sz, 4);
-      const int64_t imm = read_signed(post_modrm, imm_sz);
+      const uint64_t imm = read_signed(post_modrm, imm_sz);
       cpu.rip += imm_sz;
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 0: {
           snprintf(str, len, "MOV  %s, 0x%lx", modrm.str, imm);
-          exe_mov(dest_addr, post_modrm, operand_sz);
+          exe_mov(dest_addr, &imm, operand_sz);
           return;
         }
         default: panic("Subop of 0xC7 not implemented!");
@@ -1851,7 +2017,7 @@ static void decode_one_byte_opcode(String assembly) {
 
       uint64_t a = read_unsigned(dest_addr, operand_sz);
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 4: {
           snprintf(str, len, "SHL  %s, 0x1", modrm.str); 
           exe_shl(dest_addr, operand_sz, a, 1);
@@ -1868,7 +2034,7 @@ static void decode_one_byte_opcode(String assembly) {
       uint64_t b = cpu.cl;
       if( operand_sz == 8 ) { b &= 0x3F; } else { b &= 0x1F; }
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 4: {
           snprintf(str, len, "SHL  %s, cl", modrm.str); 
           exe_shl(dest_addr, operand_sz, a, b);
@@ -1882,6 +2048,9 @@ static void decode_one_byte_opcode(String assembly) {
         default: panic("Subop of 0xD3 not implemented!");
       }
     }
+    case 0xD9: {
+      // TODO implement FNSTCW
+    }
     case 0xDB: {
       ++(cpu.rip);
       if( *(opcode+1) == 0xE3 ) {
@@ -1890,6 +2059,31 @@ static void decode_one_byte_opcode(String assembly) {
         snprintf(str, len, "FNINIT");
         exe_fninit();
         return;
+      }
+    }
+    case 0xDD: {
+      switch( get_ext_opcode_in_modrm(opcode+1) ) {
+        case 3: {
+          const uint8_t operand_sz = fpu_operand_sz();
+          MODRM(dest_addr);
+
+          snprintf(str, len, "FSTP  %s", modrm.str);
+          exe_store_fpu(dest_addr, 8);
+          return;
+        }
+      }
+    }
+    case 0xDF: {
+      switch( get_ext_opcode_in_modrm(opcode+1) ) {
+        case 5: {
+          const uint8_t operand_sz = fpu_operand_sz();
+          MODRM(src_addr);
+          const f80_t imm = read_signed(src_addr, 8);
+
+          snprintf(str, len, "FILD  %s", modrm.str);
+          exe_load_fpu(imm);
+          return;
+        }
       }
     }
     case 0xE2: {
@@ -1962,7 +2156,7 @@ static void decode_one_byte_opcode(String assembly) {
       const uint64_t b = read_unsigned(post_modrm, 1);
       ++(cpu.rip);
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 0: {
           snprintf(str, len, "TEST  %s, 0x%lx", modrm.str, b);
           exe_test(a, b);
@@ -1975,17 +2169,30 @@ static void decode_one_byte_opcode(String assembly) {
       const uint8_t operand_sz = rex_ext_operand_sz();
       MODRM(src_addr);
 
-      const uint64_t a = read_unsigned(src_addr, operand_sz);
-
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 2: {
+          const uint64_t a = read_unsigned(src_addr, operand_sz);
           snprintf(str, len, "NOT  %s", modrm.str);
           exe_not(src_addr, operand_sz, a);
           return;
         }
+        case 5: {
+          const int64_t a = read_signed(src_addr, operand_sz);
+          const int64_t b = read_signed(get_reg_addr(RAX, operand_sz), operand_sz);
+          snprintf(str, len, "IMUL  %s", modrm.str);
+          exe_imul(operand_sz, a, b);
+          return;
+        }
         case 6: {
+          const uint64_t a = read_unsigned(src_addr, operand_sz);
           snprintf(str, len, "DIV  %s", modrm.str);
           exe_div(operand_sz, a);
+          return;
+        }
+        case 7: {
+          const int64_t a = read_signed(src_addr, operand_sz);
+          snprintf(str, len, "IDIV  %s", modrm.str);
+          exe_idiv(operand_sz, a);
           return;
         }
         default: panic("Subop of 0xF7 not implemented!");
@@ -2011,6 +2218,19 @@ static void decode_one_byte_opcode(String assembly) {
       snprintf(str, len, "CLD");
       CLEAR_FLAG(RFLAGS_DF);
       return;
+    }
+    case 0xFE: {
+      switch( get_ext_opcode_in_modrm(opcode+1) ) {
+        case 0: {
+          const uint8_t operand_sz = 1;
+          MODRM(dest_addr);
+
+          snprintf(str, len, "INC  %s", modrm.str);
+          exe_inc(dest_addr, 1);
+          return;
+        }
+        default: panic("Subop of 0xFF not implemented!");
+      }
     }
     case 0xFF: {
       switch( get_ext_opcode_in_modrm(opcode+1) ) {
@@ -2047,6 +2267,11 @@ static void decode_one_byte_opcode(String assembly) {
 
 static void exe_cpuid(void) {
   switch( cpu.eax ) {
+    case 0x1: {
+      const uint8_t cache_line_size = 128;
+      cpu.ebx = ((uint64_t)cache_line_size / 8) << 8;
+      break;
+    }
     case 0x80000000: {
       // Maximum input value for CPUID of the form 80 00 00 0*
       cpu.eax = 0x80000008;
@@ -2061,6 +2286,7 @@ static void exe_cpuid(void) {
       cpu.edx = (1 << 29) | (1 << 26);
       break;
     }
+    default: panic("Value in EAX can't be handled by CPUID!");
   }
 }
 
@@ -2117,6 +2343,27 @@ static void exe_bsr(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a) {
   update_zf_flag(a);
 }
 
+char* cmovcc_str[] = {"CMOVO","CMOVNO","CMOVB","CMOVNB","CMOVE","CMOVNE","CMOVNA","CMOVA",
+                      "CMOVS","CMOVNS","CMOVP","CMOVNP","CMOVL","CMOVNL","CMOVNG","CMOVG"};
+
+static void exe_cmovcc(uint8_t flag, uint8_t negate, uint8_t* dest_addr, uint8_t* src_addr, uint8_t operand_sz) {
+  uint8_t cond;
+  switch( flag ) {
+    case 0: cond = GET_RFLAGS(RFLAGS_OF); break;
+    case 1: cond = GET_RFLAGS(RFLAGS_CF); break;
+    case 2: cond = GET_RFLAGS(RFLAGS_ZF); break;
+    case 3: cond = GET_RFLAGS(RFLAGS_CF) || GET_RFLAGS(RFLAGS_ZF); break;
+    case 4: cond = GET_RFLAGS(RFLAGS_SF); break;
+    case 5: cond = GET_RFLAGS(RFLAGS_PF); break;
+    case 6: cond = GET_RFLAGS(RFLAGS_SF) != GET_RFLAGS(RFLAGS_OF); break;
+    case 7: cond = GET_RFLAGS(RFLAGS_ZF) || (GET_RFLAGS(RFLAGS_SF) != GET_RFLAGS(RFLAGS_OF)); break;
+  }
+  if( negate )
+    cond = !cond;
+  if( cond )
+    exe_mov(dest_addr, src_addr, operand_sz);
+}
+
 char* ctrl_reg_str[] = {"cr0","cr1","cr2","cr3","cr4","cr5","cr6","cr7","cr8","cr9","cr10","cr11","cr12","cr13","cr14","cr15"};
 
 uint64_t* ctrl_reg_addr[] = {&(cpu.cr0),&(cpu.cr1),&(cpu.cr2),&(cpu.cr3),&(cpu.cr4)};
@@ -2150,7 +2397,7 @@ static void decode_two_byte_opcode(String assembly) {
       if( info.mode == DIRECT )
         panic("Wait, that's illegal! Direct memory addressing with 0F 01 is not allowed.");
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 2: {
           snprintf(str, len, "LGDT  %s", modrm.str);
           exe_lgdt(src_addr, operand_sz);
@@ -2206,6 +2453,33 @@ static void decode_two_byte_opcode(String assembly) {
       cpu.edx = inst_counter >> 32;
       return;
     }
+    case 0x40:
+    case 0x41:
+    case 0x42:
+    case 0x43:
+    case 0x44:
+    case 0x45:
+    case 0x46:
+    case 0x47:
+    case 0x48:
+    case 0x49:
+    case 0x4A:
+    case 0x4B:
+    case 0x4C:
+    case 0x4D:
+    case 0x4E:
+    case 0x4F: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(src_addr);
+
+      const uint8_t tttn   = *opcode & 0x0F;
+      const uint8_t flag   = (*opcode & 0b1110) >> 1;
+      const uint8_t negate = (*opcode & 0b0001) >> 0;
+
+      snprintf(str, len, "%s  %s, %s", cmovcc_str[tttn], get_reg_str(info.reg, operand_sz), modrm.str);
+      exe_cmovcc(flag, negate, get_reg_addr(info.reg, operand_sz), src_addr, operand_sz);
+      return;
+    }
     case 0x80:
     case 0x81:
     case 0x82:
@@ -2235,9 +2509,30 @@ static void decode_two_byte_opcode(String assembly) {
     }
     case 0xA2: {
       ++(cpu.rip);
-      
       snprintf(str, len, "CPUID");
       exe_cpuid();
+      return;
+    }
+    case 0xA3: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(bit_base);
+
+      uint8_t* src_addr = get_reg_addr(info.reg, operand_sz);
+      const uint64_t bit_offset = read_unsigned(src_addr, operand_sz) % (operand_sz * 8);
+
+      snprintf(str, len, "BT  %s, %s", modrm.str, get_reg_str(info.reg, operand_sz));
+      exe_bt(bit_base, operand_sz, bit_offset, 4);
+      return;
+    }
+    case 0xAB: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(bit_base);
+
+      uint8_t* src_addr = get_reg_addr(info.reg, operand_sz);
+      const uint64_t bit_offset = read_unsigned(src_addr, operand_sz) % (operand_sz * 8);
+
+      snprintf(str, len, "BTS  %s, %s", modrm.str, get_reg_str(info.reg, operand_sz));
+      exe_bt(bit_base, operand_sz, bit_offset, 5);
       return;
     }
     case 0xAD: {
@@ -2256,7 +2551,7 @@ static void decode_two_byte_opcode(String assembly) {
       const uint8_t operand_sz = rex_ext_operand_sz();
       MODRM(dest_addr);
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 0: {
           if( !(op_mode == LONG_MODE && cpu.cs_cache.l && prefixes.rex.present && prefixes.rex.w) )
             panic("FXSAVE is only implemented in 64 bit mode with REX.W == 1!");
@@ -2268,17 +2563,31 @@ static void decode_two_byte_opcode(String assembly) {
         default: panic("Subop of 0x0F 0xAE not implemented!");
       }
     }
-    case 0xB6: {
+    case 0xB3: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(bit_base);
+
+      uint8_t* src_addr = get_reg_addr(info.reg, operand_sz);
+      const uint64_t bit_offset = read_unsigned(src_addr, operand_sz) % (operand_sz * 8);
+
+      snprintf(str, len, "BTR  %s, %s", modrm.str, get_reg_str(info.reg, operand_sz));
+      exe_bt(bit_base, operand_sz, bit_offset, 6);
+      return;
+    }
+    case 0xB6:
+    case 0xB7: {
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t src_sz = w ? 2 : 1;
       const uint8_t operand_sz = rex_ext_operand_sz();
       char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
       ++(cpu.rip);
-      read_modrm(1, address_sz(), modrm, &info);
+      read_modrm(src_sz, address_sz(), modrm, &info);
       
       uint8_t* src_addr;
       if( info.mode == INDIRECT )    src_addr = ram + info.flat_addr;
       else if( info.mode == DIRECT ) src_addr = info.reg_addr;
 
-      const uint64_t src = read_unsigned(src_addr, 1);
+      const uint64_t src = read_unsigned(src_addr, src_sz);
 
       snprintf(str, len, "MOVZX  %s, %s", get_reg_str(info.reg, operand_sz), modrm.str);
       exe_mov(get_reg_addr(info.reg, operand_sz), &src, operand_sz);
@@ -2291,16 +2600,32 @@ static void decode_two_byte_opcode(String assembly) {
       const uint64_t bit_offset = read_unsigned(post_modrm, 1) % (operand_sz * 8);
       ++(cpu.rip);
 
-      switch( info.reg ) {
+      switch( info.ext_opcode ) {
         case 4:
         case 5:
         case 6: {
           snprintf(str, len, "BT%s  %s, 0x%lx", bt_inst_str[info.reg - 4], modrm.str, bit_offset);
-          exe_bt(bit_base, operand_sz, bit_offset, info.reg);
+          exe_bt(bit_base, operand_sz, bit_offset, info.ext_opcode);
           return;
         }
         default: panic("Subop of 0x0F 0xBA not implemented!");
       }
+    }
+    case 0xBE: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
+      ++(cpu.rip);
+      read_modrm(1, address_sz(), modrm, &info);
+      
+      uint8_t* src_addr;
+      if( info.mode == INDIRECT )    src_addr = ram + info.flat_addr;
+      else if( info.mode == DIRECT ) src_addr = info.reg_addr;
+
+      const uint64_t src = read_signed(src_addr, 1);
+
+      snprintf(str, len, "MOVSX  %s, %s", get_reg_str(info.reg, operand_sz), modrm.str);
+      exe_mov(get_reg_addr(info.reg, operand_sz), &src, operand_sz);
+      return;
     }
     case 0xBD: {
       const uint8_t operand_sz = rex_ext_operand_sz();
