@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <math.h>
 
 #include "x64_cpu.h"
 #include "string_struct.h"
@@ -24,7 +25,7 @@
 
 #define GET_MSB(val, size) ((val >> (size - 1)) & 0x1)
 
-#define GET_FPU_TOP ((fpu.status >> 11) & 0b111)
+#define LOG2_10 "\xFE\x8A\x1B\xCD\x4B\x78\x9A\xD4\x00\x40"
 
 #define MODRM(var)                                              \
   char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;    \
@@ -62,6 +63,8 @@ extern const uint64_t DISK_CAPACITY;
 
 extern uint8_t* ram;
 extern uint8_t* disk;
+
+extern pthread_mutex_t io_ports_mutex;
 
 extern void panic(const char*);
 extern void telwin_output(char);
@@ -385,12 +388,6 @@ static char get_str_inst_letter(uint8_t operand_sz) {
   }
 }
 
-static void create_io_thread(void) {
-  pthread_t thread;
-  if( pthread_create(&thread, NULL, io_thread, NULL) )
-    panic("Could not create the io thread!");
-}
-
 // Thanks to https://ctyme.com/intr/
 static void bios_interrupt_16(void) {
   switch( cpu.ah ) {
@@ -423,10 +420,6 @@ static void bios_interrupt_16(void) {
           //                 vram address:      0xA000; (idk for sure)
           //
           // UNUSED es:[di] = CRTC information block
-
-          // TODO keep an eye on this
-          // create_io_thread();
-
           cpu.al = 0x4F;
           cpu.ah = 0;
           return;
@@ -1193,11 +1186,68 @@ static void exe_loop(uint8_t addr_sz, int64_t disp) {
 }
 
 static void exe_in(uint8_t* dest_addr, uint8_t dest_sz, uint16_t port) {
+  pthread_mutex_lock(&io_ports_mutex);
+  
   memcpy(dest_addr, cpu.io_ports + port, dest_sz);
+
+  pthread_mutex_unlock(&io_ports_mutex);
 }
 
 static void exe_out(uint8_t* src_addr, uint8_t src_sz, uint16_t port) {
+  pthread_mutex_lock(&io_ports_mutex);
+  
   memcpy(cpu.io_ports + port, src_addr, src_sz);
+  
+  if( port == 0x70 )
+    update_RTC();
+
+  pthread_mutex_unlock(&io_ports_mutex);
+}
+
+static void exe_convert(uint8_t operand_sz) {
+  const uint8_t sign = read_signed(get_reg_addr(RAX, operand_sz), operand_sz) < 0;
+  const uint64_t rdx[] = { 0x0000000000000000, 0xFFFFFFFFFFFFFFFF };
+  memcpy(get_reg_addr(RDX, operand_sz), rdx + sign, operand_sz);
+}
+
+// *********************
+// *  FPU INSTUCTIONS  *
+// *********************
+
+uint8_t get_fpu_top(void) {
+  return (fpu.status >> 11) & 0b111;
+}
+
+static void set_fpu_top(uint8_t top) {
+  fpu.status &= 0b1100011111111111;
+  fpu.status |= top << 11;
+}
+
+static uint8_t reg_st(int8_t disp) {
+  return (get_fpu_top() + disp) & 0b111;
+}
+
+static f80_t* addr_st(int8_t disp) {
+  return fpu.r0 + 10*reg_st(disp);
+}
+
+f80_t val_st(int8_t disp) {
+  return *addr_st(disp);
+}
+
+static void pop_fpu(void) {
+  fpu.tags |= (uint16_t)0b11 << (2*reg_st(0));
+  set_fpu_top(reg_st(1)); 
+}
+
+static void push_fpu(void) {
+  set_fpu_top(reg_st(-1));
+}
+
+static void store_fpu_st(int8_t disp, f80_t src) {
+  memcpy(addr_st(disp), &src, 10);
+  fpu.tags &= ~((uint16_t)0b11 << (2*reg_st(disp)));
+  fpu.tags |= (uint16_t)(src == 0 ? 0b01 : 0b00) << (2*reg_st(disp));
 }
 
 static void exe_fninit(void) {
@@ -1227,37 +1277,55 @@ static void exe_fxsave64(uint8_t* dest_addr) {
   memcpy(dest_addr + 144, &(fpu.r7), 10);
 }
 
-static void exe_convert(uint8_t operand_sz) {
-  const uint8_t sign = read_signed(get_reg_addr(RAX, operand_sz), operand_sz) < 0;
-  const uint64_t rdx[] = { 0x0000000000000000, 0xFFFFFFFFFFFFFFFF };
-  memcpy(get_reg_addr(RDX, operand_sz), rdx + sign, operand_sz);
-}
-
 static void exe_load_fpu(f80_t src) {
-  const uint16_t top = (GET_FPU_TOP - 1) & 0b111;
-  fpu.status &= 0b1100011111111111;
-  fpu.status |= top << 11;
-
-  const uint8_t* src_addr = &src;
-  memcpy(fpu.r0 + 10*top, src_addr, 10);
-  fpu.tags &= ~((uint16_t)0b11 << (2*top));
-  fpu.tags |= (uint16_t)(src == 0 ? 0b01 : 0b00) << (2*top);
+  push_fpu();
+  store_fpu_st(0, src);
 }
 
 static void exe_store_fpu(uint8_t* dest_addr, uint8_t dest_sz) {
-  const f80_t st0 = *(f80_t*)(fpu.r0 + 10*GET_FPU_TOP);
   uint8_t* src_addr;
   switch( dest_sz ) {
-    case 4:  { const f32_t src = st0; src_addr = &src; break; }
-    case 8:  { const f64_t src = st0; src_addr = &src; break; }
-    case 10: { const f80_t src = st0; src_addr = &src; break; }
+    case 4:  { const f32_t src = val_st(0); src_addr = &src; break; }
+    case 8:  { const f64_t src = val_st(0); src_addr = &src; break; }
+    case 10: { const f80_t src = val_st(0); src_addr = &src; break; }
   }
   memcpy(dest_addr, src_addr, dest_sz);
-  fpu.tags |= (uint16_t)0b11 << (2*GET_FPU_TOP);
+  pop_fpu();
+}
 
-  const uint16_t top = (GET_FPU_TOP + 1) & 0b111;
-  fpu.status &= 0b1100011111111111;
-  fpu.status |= top << 11;
+static void exe_fmulp(void) {
+  store_fpu_st(1, val_st(0) * val_st(1));
+  pop_fpu();
+}
+
+static void exe_faddp(void) {
+  store_fpu_st(1, val_st(0) + val_st(1));
+  pop_fpu();
+}
+
+static void exe_fsubrp(void) {
+  store_fpu_st(1, val_st(0) - val_st(1));
+  pop_fpu();
+}
+
+static void exe_frndint(void) {
+  store_fpu_st(0, roundl(val_st(0)));
+}
+
+static void exe_f2xm1(void) {
+  store_fpu_st(0, powl(2, val_st(0)) - 1.0L);
+}
+
+static void exe_fscale(void) {
+  store_fpu_st(0, val_st(0) * powl(2, truncl(val_st(1))));
+}
+
+static void exe_ffree(int8_t disp) {
+  fpu.tags |= (uint16_t)0b11 << (2*reg_st(disp));
+}
+
+static void exe_fincstp(void) {
+  set_fpu_top(reg_st(1));
 }
 
 static void decode_one_byte_opcode(String assembly) {
@@ -1552,6 +1620,23 @@ static void decode_one_byte_opcode(String assembly) {
       exe_pop(get_reg_addr(opcode_reg, operand_sz), operand_sz);
       return;
     }
+    case 0x63: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      const uint8_t src_sz = MIN(operand_sz, 4);
+      char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;
+      ++(cpu.rip);
+      read_modrm(src_sz, address_sz(), modrm, &info);
+      
+      uint8_t* src_addr;
+      if( info.mode == INDIRECT )    src_addr = ram + info.flat_addr;
+      else if( info.mode == DIRECT ) src_addr = info.reg_addr;
+
+      const uint64_t src = read_signed(src_addr, src_sz);
+
+      snprintf(str, len, "MOVSXD  %s, %s", get_reg_str(info.reg, operand_sz), modrm.str);
+      exe_mov(get_reg_addr(info.reg, operand_sz), &src, operand_sz);
+      return;
+    }
     case 0x68: {
       const uint8_t operand_sz = not_rex_ext_operand_sz();
       const uint8_t imm_sz = MIN(operand_sz, 4);
@@ -1584,6 +1669,20 @@ static void decode_one_byte_opcode(String assembly) {
 
       snprintf(str, len, "PUSH  0x%lx", imm);
       exe_push(&imm, operand_sz);
+      return;
+    }
+    case 0x6B: {
+      const uint8_t operand_sz = rex_ext_operand_sz();
+      MODRM(src_addr);
+      const int64_t a = read_signed(src_addr, operand_sz);
+      const int64_t b = read_signed(post_modrm, 1);
+      ++(cpu.rip);
+
+      snprintf(str, len, "IMUL  %s, %s, %c0x%lx", get_reg_str(info.reg, operand_sz),
+                                                  modrm.str,
+                                                  pos_neg[b<0],
+                                                  ABS(b));
+      exe_imul(operand_sz, a, b);
       return;
     }
     case 0x70:
@@ -2049,29 +2148,135 @@ static void decode_one_byte_opcode(String assembly) {
       }
     }
     case 0xD9: {
-      // TODO implement FNSTCW
+      switch( *(opcode+1) ) {
+        case 0xE8: {
+          cpu.rip += 2;
+          snprintf(str, len, "FLD1");
+          exe_load_fpu(1.0L);
+          return;
+        }
+        case 0xE9: {
+          cpu.rip += 2;
+          snprintf(str, len, "FLDL2T");
+          f80_t src; memcpy(&src, LOG2_10, 10);
+          exe_load_fpu(src);
+          return;
+        }
+        case 0xF0: {
+          cpu.rip += 2;
+          snprintf(str, len, "F2XM1");
+          exe_f2xm1();
+          return;
+        }
+        case 0xF7: {
+          cpu.rip += 2;
+          snprintf(str, len, "FINCSTP");
+          exe_fincstp();
+          return;
+        }
+        case 0xFC: {
+          cpu.rip += 2;
+          snprintf(str, len, "FRNDINT");
+          exe_frndint();
+          return;
+        }
+        case 0xFD: {
+          cpu.rip += 2;
+          snprintf(str, len, "FSCALE");
+          exe_fscale();
+          return;
+        }
+      }
+
+      const uint8_t operand_sz = fpu_operand_sz();
+      MODRM(modrm_addr);
+      
+      switch( info.ext_opcode ) {
+        case 5: {
+          snprintf(str, len, "FLDCW  %s", modrm.str);
+          memcpy(&(fpu.control), modrm_addr, 2);
+          return;
+        }
+        case 7: {
+          snprintf(str, len, "FNSTCW  %s", modrm.str);
+          memcpy(modrm_addr, &(fpu.control), 2);
+          return;
+        }
+      }
+      panic("Subop of 0xD9 not implemented!");
     }
     case 0xDB: {
-      ++(cpu.rip);
       if( *(opcode+1) == 0xE3 ) {
-        ++(cpu.rip);
-
+        cpu.rip += 2;
         snprintf(str, len, "FNINIT");
         exe_fninit();
         return;
       }
+      panic("Subop of 0xDB not implemented!");
     }
     case 0xDD: {
-      switch( get_ext_opcode_in_modrm(opcode+1) ) {
-        case 3: {
-          const uint8_t operand_sz = fpu_operand_sz();
-          MODRM(dest_addr);
-
-          snprintf(str, len, "FSTP  %s", modrm.str);
-          exe_store_fpu(dest_addr, 8);
+      switch( *(opcode+1) ) {
+        case 0xC0:
+        case 0xC1:
+        case 0xC2:
+        case 0xC3:
+        case 0xC4:
+        case 0xC5:
+        case 0xC6:
+        case 0xC7: {
+          cpu.rip += 2;
+          snprintf(str, len, "FFREE");
+          exe_ffree( *(opcode+1) & 0b111 );
           return;
         }
       }
+
+      const uint8_t operand_sz = fpu_operand_sz();
+      MODRM(modrm_addr);
+
+      switch( info.ext_opcode ) {
+        case 0: {
+          snprintf(str, len, "FLD  %s", modrm.str);
+          const f80_t imm = *(f64_t*)modrm_addr;
+          exe_load_fpu(imm);
+          return;
+        }
+        case 2: {
+          snprintf(str, len, "FST  %s", modrm.str);
+          const f64_t st0 = val_st(0);
+          memcpy(modrm_addr, &st0, 8);
+          return;
+        }
+        case 3: {
+          snprintf(str, len, "FSTP  %s", modrm.str);
+          exe_store_fpu(modrm_addr, 8);
+          return;
+        }
+      }
+      panic("Subop of 0xDD not implemented!");
+    }
+    case 0xDE: {
+      switch( *(opcode+1) ) {
+        case 0xC1: {
+          cpu.rip += 2;
+          snprintf(str, len, "FADDP");
+          exe_faddp();
+          return;
+        }
+        case 0xC9: {
+          cpu.rip += 2;
+          snprintf(str, len, "FMULP");
+          exe_fmulp();
+          return;
+        }
+        case 0xE1: {
+          cpu.rip += 2;
+          snprintf(str, len, "FSUBRP");
+          exe_fsubrp();
+          return;
+        }
+      }
+      panic("Subop of 0xDE not implemented!");
     }
     case 0xDF: {
       switch( get_ext_opcode_in_modrm(opcode+1) ) {
@@ -2085,6 +2290,7 @@ static void decode_one_byte_opcode(String assembly) {
           return;
         }
       }
+      panic("Subop of 0xDF not implemented!");
     }
     case 0xE2: {
       const int64_t disp = read_signed(opcode+1, 1);

@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include <ncurses.h>
 
@@ -29,6 +30,8 @@ const uint64_t DISK_CAPACITY = 32000000;
 
 uint8_t* ram;
 uint8_t* disk;
+
+pthread_mutex_t io_ports_mutex;
 
 static void init_ram(void) {
   if( (ram = malloc(RAM_CAPACITY)) == NULL )
@@ -162,6 +165,12 @@ static void setup_BIOS32(void) {
   memcpy(BIOS32_ptr + 16, bios_proc, sizeof(bios_proc));
   memcpy(BIOS32_ptr + 17, &PCI_BASE_ADDR, 4);
   memcpy(BIOS32_ptr + 22, &PCI_OFFSET, 4);
+}
+
+static void create_io_thread(void) {
+  pthread_t thread;
+  if( pthread_create(&thread, NULL, io_thread, NULL) )
+    panic("Could not create the io thread!");
 }
 
 // ************ //
@@ -305,8 +314,8 @@ static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
     mvwprintw(win, 8 - i, regs_x, "r%u: %04x%016lx  %u%u", i, *(uint16_t*)(reg+8), *(uint64_t*)reg, tag>>1, tag&1);
   }
 
-  mvwprintw(win, 10, 2, "TOP:%01hhx", GET_FPU_TOP);
-  mvwprintw(win, 10, 8, "%10.11Lf", *(f80_t*)(fpu.r0 + 10*GET_FPU_TOP));
+  mvwprintw(win, 10, 2, "TOP:%01hhx", get_fpu_top());
+  mvwprintw(win, 10, 8, "%10.11Lf", val_st(0));
   wrefresh(win);
 }
 
@@ -349,6 +358,9 @@ int32_t main(void) {
   init_ram();
   init_disk();
   init_cpu();
+
+  pthread_mutex_init(&io_ports_mutex, NULL);
+  create_io_thread();
 
   setup_BIOS32();
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
@@ -486,6 +498,8 @@ int32_t main(void) {
   }
 
   endwin();
+
+  pthread_mutex_destroy(&io_ports_mutex);
 
   return 0;
 }
