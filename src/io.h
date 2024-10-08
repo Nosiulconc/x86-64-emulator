@@ -5,14 +5,15 @@
 #include <pthread.h>
 #include <time.h>
 
+extern x64_CPU cpu;
 extern uint8_t* ram;
 extern pthread_mutex_t io_ports_mutex;
 
 // starts at port 0x40
 typedef struct __attribute__((packed)) {
-  uint8_t channel_0;
-  uint8_t channel_1;
-  uint8_t channel_2;
+  uint8_t chan0;
+  uint8_t chan1;
+  uint8_t chan2;
 
   uint8_t count_mode  : 1;
   uint8_t op_mode     : 3;
@@ -21,49 +22,134 @@ typedef struct __attribute__((packed)) {
 }
 PIT_Ports;
 
-typedef enum { WAIT_RESET, WRITE_WAIT_LOW_BYTE, WRITE_WAIT_HIGH_BYTE, UPDATE_COUNTER, READ_WAIT_HIGH_BYTE } PIT_State;
+typedef enum { LOWBYTE_ONLY = 1, HIGHBYTE_ONLY = 2, LOWBYTE_HIGHBYTE = 3 } PIT_AccessMode;
+typedef enum { WAITING_RELOAD_VALUE, COUNTING, WRITE_HIGHBYTE, READ_HIGHBYTE, READ_HIGHBYTE_AND_SAVE_TO_COUNTER } PIT_ChannelState;
 
 typedef struct {
-  uint16_t counter;
   uint16_t reload_value;
-  PIT_State state;
+  uint16_t counter;
+  PIT_AccessMode access_mode;
+  uint8_t op_mode;
+  PIT_ChannelState state;
+}
+PIT_Channel;
+
+typedef struct {
+  PIT_Channel chan0;
 }
 PIT;
 
-// PIT initial state: WAIT_RESET
-// 
-// WAIT_RESET:
-// ON OUT 0x43, al -> goto WRITE_WAIT_LOW_BYTE
-//
-// WRITE_WAIT_LOW_BYTE:
-// ON OUT 0x40, al -> write low byte, goto WRITE_WAIT_HIGH_BYTE
-//
-// WRITE_WAIT_HIGH_BYTE:
-// ON OUT 0x40, al -> write high byte, goto UPDATE_COUNTER
-//
-// UPDATE_COUNTER:
-// decrement counter
-// ON counter == 0 -> trigger IRQ0, goto WAIT_RESET
-// ON IN al, 0x40 -> give low byte, goto READ_WAIT_HIGH_BYTE
-//
-// READ_WAIT_HIGH_BYTE:
-// ON IN al, 0x40 -> give high byte, goto UPDATE_COUNTER
+extern PIT pit;
 
-void reset_PIT(void) {
-  // port 0x43 has been written to (only accepts 0)
+// on OUT 0x43, al:
+// if read_back command -> panic
+// if latch command -> do nothing
+// else if not channel 1 -> reconfigure selected channel
+
+// on IN al, 0x40 | 0x42:
+// if access_mode is single byte -> write counter byte in 0x40 | 0x42
+// else -> if state is COUNTING: ( write lowbyte and go to WRITE_HIGH ) else if WRITE_HIGH: ( write highbyte and go to COUNTING )
+
+// on OUT 0x40 | 0x42, al:
+// if access_mode is single byte -> write 0x40 | 0x42 in reload value and counter byte
+// else -> if state is COUNTING: ( write lowbyte and go to READ_HIGH ) else if READ_HIGH: ( write highbyte and go to COUNTING ) 
+
+void PIT_override_mode(void) {
+  const PIT_Ports ports = *(PIT_Ports*)(cpu.io_ports + 0x40);
+
+  if( ports.select_chan == 0b11 ) panic("PIT can't handle readback commands!");
+  if( ports.access_mode == 0b00 ) return; // ignore latch commands
+
+  if( ports.select_chan != 0b00 ) panic("PIT channel 1 and 2 are not implemented!");
+  if( ports.op_mode != 2 ) panic("PIT mode 0, 1, 3, 4, 5 are not implemented!");
+  if( ports.count_mode == 1 ) panic("PIT BCD counting is not implemented!");
+  pit.chan0.access_mode = ports.access_mode;
+  pit.chan0.op_mode = ports.op_mode;
+  pit.chan0.state = WAITING_RELOAD_VALUE;
 }
 
-void write_PIT(void) {
-  // waits low then high byte for the reload value
+void PIT_read_counter(uint16_t port) {
+  if( port != 0x40 ) panic("PIT Can't read channel 1 and 2 counters!");
+
+  switch( pit.chan0.access_mode ) {
+    case LOWBYTE_ONLY: {
+      if( pit.chan0.state != COUNTING ) return; 
+      cpu.io_ports[port] = pit.chan0.counter & 0xFF;
+    } break;
+    case HIGHBYTE_ONLY: {
+      if( pit.chan0.state != COUNTING ) return; 
+      cpu.io_ports[port] = pit.chan0.counter >> 8;
+    } break;
+    case LOWBYTE_HIGHBYTE: {
+      switch( pit.chan0.state ) {
+	case COUNTING: {
+	  cpu.io_ports[port] = pit.chan0.counter & 0xFF;
+	  pit.chan0.state = WRITE_HIGHBYTE;
+	} break;
+	case WRITE_HIGHBYTE: {
+	  cpu.io_ports[port] = pit.chan0.counter >> 8;
+          pit.chan0.state = COUNTING;
+	} break;
+        default:
+      }
+    } break;
+  }
 }
 
-void read_PIT(void) {
-  // give low then high byte
+void PIT_write_reload_value(uint16_t port) {
+  if( port != 0x40 ) panic("PIT Can't write to channel 1 and 2 counters!");
+
+  switch( pit.chan0.access_mode ) {
+    case LOWBYTE_ONLY: {
+      if( !(pit.chan0.state == COUNTING || pit.chan0.state == WAITING_RELOAD_VALUE) ) return; 
+      pit.chan0.reload_value &= 0xFF00;
+      pit.chan0.reload_value |= cpu.io_ports[port];
+      if( pit.chan0.state == WAITING_RELOAD_VALUE ) {
+	pit.chan0.counter = pit.chan0.reload_value;
+        pit.chan0.state = COUNTING;
+      }
+    } break;
+    case HIGHBYTE_ONLY: {
+      if( !(pit.chan0.state == COUNTING || pit.chan0.state == WAITING_RELOAD_VALUE) ) return; 
+      pit.chan0.reload_value &= 0x00FF;
+      pit.chan0.reload_value |= cpu.io_ports[port] << 8;
+      if( pit.chan0.state == WAITING_RELOAD_VALUE ) {
+	pit.chan0.counter = pit.chan0.reload_value;
+        pit.chan0.state = COUNTING;
+      }
+    } break;
+    case LOWBYTE_HIGHBYTE: {
+      switch( pit.chan0.state ) {
+	case WAITING_RELOAD_VALUE: {
+	  pit.chan0.reload_value = cpu.io_ports[port];
+	  pit.chan0.state = READ_HIGHBYTE_AND_SAVE_TO_COUNTER;
+	} break;
+	case READ_HIGHBYTE_AND_SAVE_TO_COUNTER: {
+	  pit.chan0.reload_value |= cpu.io_ports[port] << 8;
+	  pit.chan0.counter = pit.chan0.reload_value;
+          pit.chan0.state = COUNTING;
+	} break;
+	case COUNTING: {
+	  pit.chan0.reload_value = cpu.io_ports[port];
+	  pit.chan0.state = READ_HIGHBYTE;
+	} break;
+	case READ_HIGHBYTE: {
+	  pit.chan0.reload_value |= cpu.io_ports[port] << 8;
+          pit.chan0.state = COUNTING;
+	} break;
+        default:
+      }
+    } break;
+  }
 }
 
-void update_PIT_counter(void) {
-  // decrement counter
-  // if counter is 0 then trigger IRQ0 and wait reset
+void PIT_update_counter(void) {
+  if( pit.chan0.state == WAITING_RELOAD_VALUE || pit.chan0.state == READ_HIGHBYTE_AND_SAVE_TO_COUNTER ) return;
+  --pit.chan0.counter;
+  if( pit.chan0.counter == 0 ) {
+    pit.chan0.counter = pit.chan0.reload_value;
+    // send IRQ0
+  }
 }
 
 void update_RTC(void) {

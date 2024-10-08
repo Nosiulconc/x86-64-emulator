@@ -2,18 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdarg.h>
 
 #include <ncurses.h>
 
 #include "x64_cpu.h"
 #include "inst_decoder.h"
 #include "string_struct.h"
-
-void panic(const char* msg) {
-  endwin();
-  printf("ERROR: %s\n", msg);
-  exit(1);
-}
 
 // ******************* //
 // **   EMULATION   ** //
@@ -24,6 +19,7 @@ OperationMode op_mode = REAL_MODE;
 uint64_t inst_counter;
 
 x87_FPU fpu;
+PIT pit;
 
 const uint64_t RAM_CAPACITY = 32000000;
 const uint64_t DISK_CAPACITY = 32000000;
@@ -32,6 +28,10 @@ uint8_t* ram;
 uint8_t* disk;
 
 pthread_mutex_t io_ports_mutex;
+
+uint64_t panic_rip = 0;
+
+void panic(const char*, ...);
 
 static void init_ram(void) {
   if( (ram = malloc(RAM_CAPACITY)) == NULL )
@@ -79,12 +79,12 @@ close_file_then_exit:
   exit(1);
 }
 
-static void load_inst_counter_from_file(const char* path) {
+static void load_inst_counter_from_file(const char* path, uint64_t* counter_ptr) {
   FILE* file;
   if( (file = fopen(path, "r")) == NULL )
     panic("Couldn't open the file!");
 
-  if( fscanf(file, "%ld", &inst_counter) < 1 ) {
+  if( fscanf(file, "%ld", counter_ptr) < 1 ) {
     puts("Couldn't parse inst_counter!");
     if( fclose(file) == EOF )
       panic("Couldn't close the file!");
@@ -137,6 +137,15 @@ static void load_bootloader_into_ram(void) {
   memcpy(ram + load_segment * 16, disk + bootloader_ptr, sector_count * 2048);
 }
 
+static void setup_PIT(void) {
+  // Continuously generates IRQ0 ~18 times a second
+  pit.chan0 = (PIT_Channel){ .reload_value = 65535,
+	                     .counter = 65535,
+                             .access_mode = LOWBYTE_HIGHBYTE,
+                             .op_mode = 2,
+                             .state = COUNTING };
+}
+
 // Thanks to https://wiki.osdev.org/BIOS32 
 static void setup_BIOS32(void) {
   uint8_t* BIOS32_ptr = ram + 0xE0000;
@@ -181,6 +190,11 @@ char str[29] = "none";
 String assembly = { 28, str };
 uint64_t phyaddr = 0;
 char* phyaddr_seg = "--";
+
+static void tick(void) {
+  decode_instruction(assembly);
+  PIT_update_counter();
+}
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
   uint8_t* rip = base_addr + get_flat_address(CS, get_ip());
@@ -232,76 +246,80 @@ static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
   wrefresh(win);
 }
 
-static void draw_regwin(WINDOW* win, int32_t width, int32_t height) {
-  werase(win);
-  box(win, 0, 0);
+const int32_t reg_width  = 64;
+const int32_t reg_height = 21;
+WINDOW* regwin;
 
-  mvwprintw(win, 1, 1, "rax: %08lx.%04x.%02hhx.%02hhx", cpu.rax >> 32, cpu.eax >> 16, cpu.ah, cpu.al);
-  mvwprintw(win, 2, 1, "rbx: %08lx.%04x.%02hhx.%02hhx", cpu.rbx >> 32, cpu.ebx >> 16, cpu.bh, cpu.bl);
-  mvwprintw(win, 3, 1, "rcx: %08lx.%04x.%02hhx.%02hhx", cpu.rcx >> 32, cpu.ecx >> 16, cpu.ch, cpu.cl);
-  mvwprintw(win, 4, 1, "rdx: %08lx.%04x.%02hhx.%02hhx", cpu.rdx >> 32, cpu.edx >> 16, cpu.dh, cpu.dl);
+static void draw_regwin(void) {
+  werase(regwin);
+  box(regwin, 0, 0);
 
-  mvwprintw(win, 6, 1, "rdi: %08lx.%04x.%02x.%02hhx", cpu.rdi >> 32, cpu.edi >> 16, cpu.di >> 8, cpu.dil);
-  mvwprintw(win, 7, 1, "rsi: %08lx.%04x.%02x.%02hhx", cpu.rsi >> 32, cpu.esi >> 16, cpu.si >> 8, cpu.sil);
+  mvwprintw(regwin, 1, 1, "rax: %08lx.%04x.%02hhx.%02hhx", cpu.rax >> 32, cpu.eax >> 16, cpu.ah, cpu.al);
+  mvwprintw(regwin, 2, 1, "rbx: %08lx.%04x.%02hhx.%02hhx", cpu.rbx >> 32, cpu.ebx >> 16, cpu.bh, cpu.bl);
+  mvwprintw(regwin, 3, 1, "rcx: %08lx.%04x.%02hhx.%02hhx", cpu.rcx >> 32, cpu.ecx >> 16, cpu.ch, cpu.cl);
+  mvwprintw(regwin, 4, 1, "rdx: %08lx.%04x.%02hhx.%02hhx", cpu.rdx >> 32, cpu.edx >> 16, cpu.dh, cpu.dl);
 
-  mvwprintw(win, 9,  1, "rbp: %08lx.%04x.%02x.%02hhx", cpu.rbp >> 32, cpu.ebp >> 16, cpu.bp >> 8, cpu.bpl);
-  mvwprintw(win, 10, 1, "rsp: %08lx.%04x.%02x.%02hhx", cpu.rsp >> 32, cpu.esp >> 16, cpu.sp >> 8, cpu.spl);
+  mvwprintw(regwin, 6, 1, "rdi: %08lx.%04x.%02x.%02hhx", cpu.rdi >> 32, cpu.edi >> 16, cpu.di >> 8, cpu.dil);
+  mvwprintw(regwin, 7, 1, "rsi: %08lx.%04x.%02x.%02hhx", cpu.rsi >> 32, cpu.esi >> 16, cpu.si >> 8, cpu.sil);
 
-  mvwprintw(win, 12, 1, "r8 : %08lx.%04x.%02x.%02hhx", cpu.r8>>32, cpu.r8d>>16, cpu.r8w>>8, cpu.r8b);
-  mvwprintw(win, 13, 1, "r9 : %08lx.%04x.%02x.%02hhx", cpu.r9>>32, cpu.r9d>>16, cpu.r9w>>8, cpu.r9b);
-  mvwprintw(win, 14, 1, "r10: %08lx.%04x.%02x.%02hhx", cpu.r10>>32, cpu.r10d>>16, cpu.r10w>>8, cpu.r10b);
-  mvwprintw(win, 15, 1, "r11: %08lx.%04x.%02x.%02hhx", cpu.r11>>32, cpu.r11d>>16, cpu.r11w>>8, cpu.r11b);
-  mvwprintw(win, 16, 1, "r12: %08lx.%04x.%02x.%02hhx", cpu.r12>>32, cpu.r12d>>16, cpu.r12w>>8, cpu.r12b);
-  mvwprintw(win, 17, 1, "r13: %08lx.%04x.%02x.%02hhx", cpu.r13>>32, cpu.r13d>>16, cpu.r13w>>8, cpu.r13b);
-  mvwprintw(win, 18, 1, "r14: %08lx.%04x.%02x.%02hhx", cpu.r14>>32, cpu.r14d>>16, cpu.r14w>>8, cpu.r14b);
-  mvwprintw(win, 19, 1, "r15: %08lx.%04x.%02x.%02hhx", cpu.r15>>32, cpu.r15d>>16, cpu.r15w>>8, cpu.r15b);
+  mvwprintw(regwin, 9,  1, "rbp: %08lx.%04x.%02x.%02hhx", cpu.rbp >> 32, cpu.ebp >> 16, cpu.bp >> 8, cpu.bpl);
+  mvwprintw(regwin, 10, 1, "rsp: %08lx.%04x.%02x.%02hhx", cpu.rsp >> 32, cpu.esp >> 16, cpu.sp >> 8, cpu.spl);
 
-  mvwprintw(win, 1, 26, "cs: %04x", cpu.cs);
-  mvwprintw(win, 2, 26, "ss: %04x", cpu.ss);
-  mvwprintw(win, 3, 26, "ds: %04x", cpu.ds);
-  mvwprintw(win, 4, 26, "es: %04x", cpu.es);
-  mvwprintw(win, 5, 26, "fs: %04x", cpu.fs);
-  mvwprintw(win, 6, 26, "gs: %04x", cpu.gs);
+  mvwprintw(regwin, 12, 1, "r8 : %08lx.%04x.%02x.%02hhx", cpu.r8>>32, cpu.r8d>>16, cpu.r8w>>8, cpu.r8b);
+  mvwprintw(regwin, 13, 1, "r9 : %08lx.%04x.%02x.%02hhx", cpu.r9>>32, cpu.r9d>>16, cpu.r9w>>8, cpu.r9b);
+  mvwprintw(regwin, 14, 1, "r10: %08lx.%04x.%02x.%02hhx", cpu.r10>>32, cpu.r10d>>16, cpu.r10w>>8, cpu.r10b);
+  mvwprintw(regwin, 15, 1, "r11: %08lx.%04x.%02x.%02hhx", cpu.r11>>32, cpu.r11d>>16, cpu.r11w>>8, cpu.r11b);
+  mvwprintw(regwin, 16, 1, "r12: %08lx.%04x.%02x.%02hhx", cpu.r12>>32, cpu.r12d>>16, cpu.r12w>>8, cpu.r12b);
+  mvwprintw(regwin, 17, 1, "r13: %08lx.%04x.%02x.%02hhx", cpu.r13>>32, cpu.r13d>>16, cpu.r13w>>8, cpu.r13b);
+  mvwprintw(regwin, 18, 1, "r14: %08lx.%04x.%02x.%02hhx", cpu.r14>>32, cpu.r14d>>16, cpu.r14w>>8, cpu.r14b);
+  mvwprintw(regwin, 19, 1, "r15: %08lx.%04x.%02x.%02hhx", cpu.r15>>32, cpu.r15d>>16, cpu.r15w>>8, cpu.r15b);
 
-  mvwprintw(win, 8,  26, "RFLAGS");
-  mvwprintw(win, 9,  26, "CF:%lu", GET_RFLAGS(RFLAGS_CF));
-  mvwprintw(win, 10, 26, "PF:%lu", GET_RFLAGS(RFLAGS_PF));
-  mvwprintw(win, 11, 26, "AF:%lu", GET_RFLAGS(RFLAGS_AF));
-  mvwprintw(win, 12, 26, "ZF:%lu", GET_RFLAGS(RFLAGS_ZF));
-  mvwprintw(win, 13, 26, "SF:%lu", GET_RFLAGS(RFLAGS_SF));
-  mvwprintw(win, 14, 26, "IF:%lu", GET_RFLAGS(RFLAGS_IF));
-  mvwprintw(win, 15, 26, "DF:%lu", GET_RFLAGS(RFLAGS_DF));
-  mvwprintw(win, 16, 26, "OF:%lu", GET_RFLAGS(RFLAGS_OF));
+  mvwprintw(regwin, 1, 26, "cs: %04x", cpu.cs);
+  mvwprintw(regwin, 2, 26, "ss: %04x", cpu.ss);
+  mvwprintw(regwin, 3, 26, "ds: %04x", cpu.ds);
+  mvwprintw(regwin, 4, 26, "es: %04x", cpu.es);
+  mvwprintw(regwin, 5, 26, "fs: %04x", cpu.fs);
+  mvwprintw(regwin, 6, 26, "gs: %04x", cpu.gs);
 
-  mvwprintw(win, 8,  33, "CR0");
-  mvwprintw(win, 9,  33, "PE:%lu", GET_CR0(CR0_PE));
-  mvwprintw(win, 10, 33, "ET:%lu", GET_CR0(CR0_ET));
-  mvwprintw(win, 11, 33, "NE:%lu", GET_CR0(CR0_NE));
-  mvwprintw(win, 12, 33, "PG:%lu", GET_CR0(CR0_PG));
+  mvwprintw(regwin, 8,  26, "RFLAGS");
+  mvwprintw(regwin, 9,  26, "CF:%lu", GET_RFLAGS(RFLAGS_CF));
+  mvwprintw(regwin, 10, 26, "PF:%lu", GET_RFLAGS(RFLAGS_PF));
+  mvwprintw(regwin, 11, 26, "AF:%lu", GET_RFLAGS(RFLAGS_AF));
+  mvwprintw(regwin, 12, 26, "ZF:%lu", GET_RFLAGS(RFLAGS_ZF));
+  mvwprintw(regwin, 13, 26, "SF:%lu", GET_RFLAGS(RFLAGS_SF));
+  mvwprintw(regwin, 14, 26, "IF:%lu", GET_RFLAGS(RFLAGS_IF));
+  mvwprintw(regwin, 15, 26, "DF:%lu", GET_RFLAGS(RFLAGS_DF));
+  mvwprintw(regwin, 16, 26, "OF:%lu", GET_RFLAGS(RFLAGS_OF));
 
-  mvwprintw(win, 8,  44, "CR3");
-  mvwprintw(win, 9,  44, "ADR:%014lx", cpu.cr3 & 0xFFFFFFFFFFFFF000);
+  mvwprintw(regwin, 8,  33, "CR0");
+  mvwprintw(regwin, 9,  33, "PE:%lu", GET_CR0(CR0_PE));
+  mvwprintw(regwin, 10, 33, "ET:%lu", GET_CR0(CR0_ET));
+  mvwprintw(regwin, 11, 33, "NE:%lu", GET_CR0(CR0_NE));
+  mvwprintw(regwin, 12, 33, "PG:%lu", GET_CR0(CR0_PG));
 
-  mvwprintw(win, 8,  38, "CR4");
-  mvwprintw(win, 9,  38, "PSE:%lu", GET_CR4(CR4_PSE));
-  mvwprintw(win, 10, 38, "PAE:%lu", GET_CR4(CR4_PAE));
-  mvwprintw(win, 11, 38, "PGE:%lu", GET_CR4(CR4_PGE));
+  mvwprintw(regwin, 8,  44, "CR3");
+  mvwprintw(regwin, 9,  44, "ADR:%014lx", cpu.cr3 & 0xFFFFFFFFFFFFF000);
 
-  mvwprintw(win, 14, 33, "EFER");
-  mvwprintw(win, 15, 33, "LME:%lu", GET_EFER(EFER_LME));
+  mvwprintw(regwin, 8,  38, "CR4");
+  mvwprintw(regwin, 9,  38, "PSE:%lu", GET_CR4(CR4_PSE));
+  mvwprintw(regwin, 10, 38, "PAE:%lu", GET_CR4(CR4_PAE));
+  mvwprintw(regwin, 11, 38, "PGE:%lu", GET_CR4(CR4_PGE));
 
-  mvwprintw(win, 17, 33, "FS_BASE: %016lx", cpu.IA32_FS_BASE);
-  mvwprintw(win, 18, 33, "GS_BASE: %016lx", cpu.IA32_GS_BASE);
+  mvwprintw(regwin, 14, 33, "EFER");
+  mvwprintw(regwin, 15, 33, "LME:%lu", GET_EFER(EFER_LME));
 
-  mvwprintw(win, 5, 35, "gdtr: %04x:%016lx", cpu.gdtr.limit, cpu.gdtr.base);
-  mvwprintw(win, 6, 35, "idtr: %04x:%016lx", cpu.idtr.limit, cpu.idtr.base);
+  mvwprintw(regwin, 17, 33, "FS_BASE: %016lx", cpu.fs_cache.base_addr);
+  mvwprintw(regwin, 18, 33, "GS_BASE: %016lx", cpu.gs_cache.base_addr);
 
-  wattron(win, A_REVERSE);
-  mvwprintw(win, 1, 35, "rip:%016lx", cpu.rip);
-  mvwprintw(win, 2, 35, "%s", assembly.str);
-  mvwprintw(win, 3, 35, "phyaddr:%s:%016lx", phyaddr_seg, phyaddr);
-  wattroff(win, A_REVERSE);
-  wrefresh(win);
+  mvwprintw(regwin, 5, 35, "gdtr: %04x:%016lx", cpu.gdtr.limit, cpu.gdtr.base);
+  mvwprintw(regwin, 6, 35, "idtr: %04x:%016lx", cpu.idtr.limit, cpu.idtr.base);
+
+  wattron(regwin, A_REVERSE);
+  mvwprintw(regwin, 1, 35, "rip:%016lx", cpu.rip);
+  mvwprintw(regwin, 2, 35, "%s", assembly.str);
+  mvwprintw(regwin, 3, 35, "phyaddr:%s:%016lx", phyaddr_seg, phyaddr);
+  wattroff(regwin, A_REVERSE);
+  wrefresh(regwin);
 }
 
 static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
@@ -354,6 +372,22 @@ static int32_t get_input_hex(WINDOW* hexwin, int32_t hex_width, int32_t hex_heig
   return 0;
 }
 
+void panic(const char* fmt, ...) {
+  draw_regwin();
+  endwin();
+
+  printf("ERROR at rip=0x%016lx, %ld instructions: ", panic_rip, inst_counter);
+  
+  va_list args_ptr;
+  va_start(args_ptr, fmt);
+  vprintf(fmt, args_ptr);
+  va_end(args_ptr);
+  
+  printf("\n");
+
+  exit(1);
+}
+
 int32_t main(void) {
   init_ram();
   init_disk();
@@ -361,6 +395,7 @@ int32_t main(void) {
 
   pthread_mutex_init(&io_ports_mutex, NULL);
   create_io_thread();
+  setup_PIT();
 
   setup_BIOS32();
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
@@ -396,12 +431,10 @@ int32_t main(void) {
   draw_ctrlwin(ctrlwin, ctrl_width, ctrl_height);
 
   // CPU registers
-  const int32_t reg_width  = hex_width - ctrl_width;
-  const int32_t reg_height = ctrl_height;
-  WINDOW* regwin = newwin(reg_height, reg_width, hex_height, 0);
+  regwin = newwin(reg_height, reg_width, hex_height, 0);
   wrefresh(stdwin);
 
-  draw_regwin(regwin, reg_width, reg_height);
+  draw_regwin();
 
   // FPU registers
   const int32_t fpu_width  = tel_width;
@@ -419,12 +452,13 @@ int32_t main(void) {
   wrefresh(telwin);
 
   // get up to speed
-  load_inst_counter_from_file("./inst_counter.txt");
-  for(uint64_t i = 0; i < inst_counter; ++i)
-    decode_instruction(assembly);
+  uint64_t counter;
+  load_inst_counter_from_file("./inst_counter.txt", &counter);
+  for(inst_counter = 0; inst_counter < counter; ++inst_counter)
+    tick();
 
   draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-  draw_regwin(regwin, reg_width, reg_height);
+  draw_regwin();
   draw_fpuwin(fpuwin, fpu_width, fpu_height);
 
   int32_t c;
@@ -466,11 +500,11 @@ int32_t main(void) {
         break;
       }
       case 'e': {
-        decode_instruction(assembly);
+        tick();
         ++inst_counter;
         
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-        draw_regwin(regwin, reg_width, reg_height);
+        draw_regwin();
         draw_fpuwin(fpuwin, fpu_width, fpu_height);
         break;
       }
@@ -484,13 +518,13 @@ int32_t main(void) {
           goto exit_run_until;
 
         while( get_flat_address(CS, get_ip()) != addr ) {
-          decode_instruction(assembly);
+          tick();
           ++inst_counter;
         }
 
       exit_run_until:
         draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
-        draw_regwin(regwin, reg_width, reg_height);
+        draw_regwin();
         draw_fpuwin(fpuwin, fpu_width, fpu_height);
         break;
       }

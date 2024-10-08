@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-extern void panic(const char* msg);
+extern void panic(const char*, ...);
+extern const uint64_t RAM_CAPACITY;
 
 typedef enum { REAL_MODE, PROTECTED_MODE, LONG_MODE } OperationMode;
 
@@ -66,7 +67,7 @@ typedef struct {
   uint16_t tr;
 
   uint64_t cr0, cr1, cr2, cr3, cr4;
-  uint64_t IA32_EFER, IA32_FS_BASE, IA32_GS_BASE;
+  uint64_t IA32_EFER;
 
   uint8_t io_ports[65536];
 }
@@ -111,7 +112,11 @@ void cpu_operation_mode_transition(void) {
         op_mode = LONG_MODE;
       break;
     }
-    case LONG_MODE: break;
+    case LONG_MODE: {
+      if( !((cpu.cr0 & CR0_PE) && (cpu.IA32_EFER & EFER_LME) && (cpu.cr4 & CR4_PAE) && (cpu.cr0 & CR0_PG)) )
+        panic("Some flags (PE, LME, PAE, PG) were changed in long mode and no way to handle it!");
+      break;
+    }
   }
 }
 
@@ -170,9 +175,6 @@ void init_cpu(void) {
   cpu.r15        = 0x0;
 
   cpu.IA32_EFER  = 0x0;
-  
-  cpu.IA32_FS_BASE = 0x0;
-  cpu.IA32_GS_BASE = 0x0;
 }
 
 uint64_t get_segment_descriptor(uint64_t segment) {
@@ -196,6 +198,7 @@ static void set_seg_reg(SegmentRegister seg_reg, uint64_t segment) {
     case LONG_MODE:
     case PROTECTED_MODE: {
       const uint64_t seg_desc = get_segment_descriptor(segment);
+      if( ((seg_desc >> 44) & 0x1) == 0 ) panic("System segment selector loaded, they're not implemented!");
       seg_reg_cache[seg_reg]->base_addr = ((seg_desc >> 32) & 0xFF000000) | ((seg_desc >> 16) & 0xFFFFFF);
       seg_reg_cache[seg_reg]->db = (seg_desc >> 54) & 0x1;
       seg_reg_cache[seg_reg]->l = (seg_desc >> 53) & 0x1;
@@ -215,8 +218,8 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
     if( cpu.cs_cache.l ) {
       uint64_t linear_addr;
       switch( seg_reg ) {
-        case FS: linear_addr = cpu.IA32_FS_BASE; break;
-        case GS: linear_addr = cpu.IA32_GS_BASE; break;
+        case FS:
+	case GS: linear_addr = seg_reg_cache[seg_reg]->base_addr; break;
         default: linear_addr = 0; break;
       }
       linear_addr += offset;
@@ -229,20 +232,37 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
       const uint64_t pdpte_index = (linear_addr >> 30) & 0x1FF;
       const uint64_t pdpte = *(uint64_t*)(ram + pdpt_addr + pdpte_index*8);
 
-      if( (pdpte >> 7) & 0x1 )
-        panic("No support for 1 GB pages!");
+      if( (pdpte >> 7) & 0x1 ) {
+	// 1 GB page
+	//panic("1GB pages are not implemented!"); // ;-)
+	/*
+	const uint64_t page_addr = pdpte & 0x000FFFFFC0000000;
+	const uint64_t page_index = linear_addr & 0x3FFFFFFF;
+	const uint64_t addr = page_addr + page_index;
+
+	if( addr >= RAM_CAPACITY )
+	  panic("Out of bounds memory access: 0x%lx", addr);
+	if( seg_reg == CS )
+	  return addr;
+	phyaddr = addr;
+	return phyaddr;*/
+      }
+
       const uint64_t pd_addr = pdpte & 0x000FFFFFFFFFF000;
       const uint64_t pde_index = (linear_addr >> 21) & 0x1FF;
       const uint64_t pde = *(uint64_t*)(ram + pd_addr + pde_index*8);
 
       if( (pde >> 7) & 0x1 ) {
         // 2 MB page
-        const uint64_t page_addr = pde & 0x000FFFFFFFF00000;
+        const uint64_t page_addr = pde & 0x000FFFFFFFE00000;
         const uint64_t page_index = linear_addr & 0x1FFFFF;
+	const uint64_t addr = page_addr + page_index;
 
+	if( addr >= RAM_CAPACITY )
+	  panic("Out of bounds memory access: 0x%lx", addr);
         if( seg_reg == CS )
-          return page_addr + page_index;
-        phyaddr = page_addr + page_index;
+          return addr;
+        phyaddr = addr;
         return phyaddr;
       }
       
@@ -252,10 +272,13 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
 
       const uint64_t page_addr = pte & 0x000FFFFFFFFFF000;
       const uint64_t page_index = (linear_addr >> 0) & 0xFFF;
+      const uint64_t addr = page_addr + page_index;
 
+      if( addr >= RAM_CAPACITY )
+        panic("Out of bounds memory access: 0x%lx", addr);
       if( seg_reg == CS )
-        return page_addr + page_index;
-      phyaddr = page_addr + page_index;
+        return addr;
+      phyaddr = addr;
       return phyaddr;
     }
     else {
