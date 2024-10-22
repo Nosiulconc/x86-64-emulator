@@ -39,11 +39,11 @@ Trust the disassembler more than the manuals.
 
 *** WHERE AM I? ***
 
-Instructions executed: 993449
+Instructions executed: 994014
 
 At this stage of development, everything should be deterministic to avoid horrors beyond our comprehension.
 
 The stack trace:
 
 - KMain:    https://templeos.xslendi.xyz/Wb/Kernel/KMain.html#l135
-  - SysGrInit:    https://templeos.xslendi.xyz/Wb/Kernel/KMain.html#l65
+  - SysDefinesLoad:    https://templeos.xslendi.xyz/Wb/Kernel/KDefine.html#l97

@@ -1222,6 +1222,14 @@ static void exe_out(uint8_t* src_addr, uint8_t src_sz, uint16_t port) {
     case 0x61: break; // Keyboard controller: used for A20 line
     case 0x70: update_RTC(); break;
     case 0x92: break; // A20 line
+    case 0x3C4: break; // VGA index port
+    case 0x3C5: { // VGA data port
+      switch( cpu.io_ports[0x3C4] ) {
+        case 2: break; // Which bit planes are affected by transformations
+	default: panic("OUT to 0x3C5 with unknown index %x!", cpu.io_ports[0x3C4]);
+      }
+      break;
+    }
     default: panic("OUT to unknown port 0x%x!", port);
   }
 
@@ -2416,6 +2424,15 @@ static void decode_one_byte_opcode(String assembly) {
       
       snprintf(str, len, "JMP  %c0x%lx", pos_neg[disp<0], ABS(disp));
       exe_jmp_rel(disp);
+      return;
+    }
+    case 0xEE: {
+      uint8_t* src_addr = get_reg_addr(RAX, 1);
+      const uint64_t port = cpu.dx;
+      ++(cpu.rip);
+
+      snprintf(str, len, "OUT  dx, %s", get_reg_str(RAX, 1));
+      exe_out(src_addr, 1, port);
       return;
     }
     case 0xF6: {
