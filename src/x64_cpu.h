@@ -219,7 +219,7 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
       uint64_t linear_addr;
       switch( seg_reg ) {
         case FS:
-	case GS: linear_addr = seg_reg_cache[seg_reg]->base_addr; break;
+	      case GS: linear_addr = seg_reg_cache[seg_reg]->base_addr; break;
         default: linear_addr = 0; break;
       }
       linear_addr += offset;
@@ -233,19 +233,19 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
       const uint64_t pdpte = *(uint64_t*)(ram + pdpt_addr + pdpte_index*8);
 
       if( (pdpte >> 7) & 0x1 ) {
-	// 1 GB page
-	//panic("1GB pages are not implemented!"); // ;-)
-	/*
-	const uint64_t page_addr = pdpte & 0x000FFFFFC0000000;
-	const uint64_t page_index = linear_addr & 0x3FFFFFFF;
-	const uint64_t addr = page_addr + page_index;
+	      // 1 GB page
+	      //panic("1GB pages are not implemented!"); // ;-)
+	      /*
+	      const uint64_t page_addr = pdpte & 0x000FFFFFC0000000;
+	      const uint64_t page_index = linear_addr & 0x3FFFFFFF;
+	      const uint64_t addr = page_addr + page_index;
 
-	if( addr >= RAM_CAPACITY )
-	  panic("Out of bounds memory access: 0x%lx", addr);
-	if( seg_reg == CS )
-	  return addr;
-	phyaddr = addr;
-	return phyaddr;*/
+	      if( addr >= RAM_CAPACITY )
+	      panic("Out of bounds memory access: 0x%lx", addr);
+	      if( seg_reg == CS )
+	        return addr;
+	      phyaddr = addr;
+	      return phyaddr;*/
       }
 
       const uint64_t pd_addr = pdpte & 0x000FFFFFFFFFF000;
@@ -256,10 +256,13 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
         // 2 MB page
         const uint64_t page_addr = pde & 0x000FFFFFFFE00000;
         const uint64_t page_index = linear_addr & 0x1FFFFF;
-	const uint64_t addr = page_addr + page_index;
+	      uint64_t addr = page_addr + page_index;
 
-	if( addr >= RAM_CAPACITY )
-	  panic("Out of bounds memory access: 0x%lx", addr);
+        // HPET MMIO (0xFED00000 ~ 0xFED00400)
+        if( addr >= 0xFED00000 && addr <= 0xFED00400 )
+          addr = 0;
+	      if( addr >= RAM_CAPACITY )
+	        panic("Out of bounds memory access: 0x%lx", addr);
         if( seg_reg == CS )
           return addr;
         phyaddr = addr;

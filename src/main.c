@@ -20,9 +20,12 @@ uint64_t inst_counter;
 
 x87_FPU fpu;
 PIT pit;
+Dual_PIC dual_pic;
+Drive drive;
 
-const uint64_t RAM_CAPACITY = 32000000;
-const uint64_t DISK_CAPACITY = 32000000;
+// NOTE: RAM capacity has to be 2MB aligned or else it crashes, it is a limitation of TOS
+const uint64_t RAM_CAPACITY = 16*0x200000;
+const uint64_t DISK_CAPACITY = 16*0x200000;
 
 uint8_t* ram;
 uint8_t* disk;
@@ -34,12 +37,12 @@ uint64_t panic_rip = 0;
 void panic(const char*, ...);
 
 static void init_ram(void) {
-  if( (ram = malloc(RAM_CAPACITY)) == NULL )
+  if( (ram = calloc(RAM_CAPACITY, 1)) == NULL )
     panic("RAM memory couldn't be allocated!");
 }
 
 static void init_disk(void) {
-  if( (disk = malloc(DISK_CAPACITY)) == NULL )
+  if( (disk = calloc(DISK_CAPACITY, 1)) == NULL )
     panic("Disk memory couldn't be allocated!");
 }
 
@@ -140,10 +143,22 @@ static void load_bootloader_into_ram(void) {
 static void setup_PIT(void) {
   // Continuously generates IRQ0 ~18 times a second
   pit.chan0 = (PIT_Channel){ .reload_value = 65535,
-	                     .counter = 65535,
+	                           .counter = 65535,
                              .access_mode = LOWBYTE_HIGHBYTE,
                              .op_mode = 2,
                              .state = COUNTING };
+}
+
+static void setup_PIC(void) {
+  dual_pic.pic1 = (PIC){ .idt_index = 0, .mask = 0xFF, .state = WAITING_COMMAND };
+  dual_pic.pic2 = (PIC){ .idt_index = 8, .mask = 0xFF, .state = WAITING_COMMAND };
+  dual_pic.processing_int = 0;
+  dual_pic.queue_top = dual_pic.queue_bot = 0;
+}
+
+static void setup_drive(void) {
+  drive.status = 0;
+  drive.state = DRIVE_WAITING_COMMAND;
 }
 
 // Thanks to https://wiki.osdev.org/BIOS32 
@@ -188,11 +203,24 @@ static void create_io_thread(void) {
 
 char str[29] = "none";
 String assembly = { 28, str };
+
 uint64_t phyaddr = 0;
 char* phyaddr_seg = "--";
 
+FunctionCall stack_trace[64];
+uint64_t stack_trace_top = 0;
+
+static void print_stack_trace(void) {
+  puts("--- STACK TRACE ---");
+  for(uint64_t i = 0; i < stack_trace_top; ++i)
+    printf("addr: 0x%lx, inst_count: %lu\n", stack_trace[i].function_addr,
+                                             stack_trace[i].inst_count);
+}
+
 static void tick(void) {
   decode_instruction(assembly);
+  //if( cpu.rip == 0xE071 )
+  //  panic("found!");
   PIT_update_counter();
 }
 
@@ -385,6 +413,8 @@ void panic(const char* fmt, ...) {
   
   printf("\n");
 
+  print_stack_trace();
+
   exit(1);
 }
 
@@ -396,9 +426,12 @@ int32_t main(void) {
   pthread_mutex_init(&io_ports_mutex, NULL);
   create_io_thread();
   setup_PIT();
+  setup_PIC();
+  setup_drive();
 
   setup_BIOS32();
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
+  memset(disk + 0x362EA, 0, 4); // Little hack to boot with any amount of RAM
   load_bootloader_into_ram();
 
   uint8_t* hex_addr = ram;
@@ -532,6 +565,8 @@ int32_t main(void) {
   }
 
   endwin();
+  
+  print_stack_trace();
 
   pthread_mutex_destroy(&io_ports_mutex);
 

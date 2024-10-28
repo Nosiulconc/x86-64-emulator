@@ -22,7 +22,13 @@ To get it working, you need the new curses library (v.6.3), SDL2 and a version o
 
 - x87 FPU: Floating Point Unit
 
-- PIT: Programmable Interrupt Timer <-- we're here
+- PIT: Programmable Interrupt Timer
+
+- HPET: High Precision Event Timer
+
+- PIC: Programmable Interrupt Controller
+
+- ATAPI
 
 *** USEFUL LINKS: ***
 
@@ -39,11 +45,11 @@ Trust the disassembler more than the manuals.
 
 *** WHERE AM I? ***
 
-Instructions executed: 994014
+Instructions executed: 1670937
 
 At this stage of development, everything should be deterministic to avoid horrors beyond our comprehension.
 
 The stack trace:
 
 - KMain:    https://templeos.xslendi.xyz/Wb/Kernel/KMain.html#l135
-  - SysDefinesLoad:    https://templeos.xslendi.xyz/Wb/Kernel/KDefine.html#l97
+  - DskChg:    https://templeos.slendi.dev/Wb/Kernel/BlkDev/DskDrv.html#l237
