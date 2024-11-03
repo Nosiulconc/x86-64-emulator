@@ -261,6 +261,9 @@ uint64_t get_flat_address(SegmentRegister seg_reg, uint64_t offset) {
         // HPET MMIO (0xFED00000 ~ 0xFED00400)
         if( addr >= 0xFED00000 && addr <= 0xFED00400 )
           addr = 0;
+        // APIC MMIO (0xFEE00000 ~ 0xFEE00400)
+        if( addr >= 0xFEE00000 && addr <= 0xFEE00400 )
+          addr = 0;
 	      if( addr >= RAM_CAPACITY )
 	        panic("Out of bounds memory access: 0x%lx", addr);
         if( seg_reg == CS )

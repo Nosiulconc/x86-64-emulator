@@ -5,11 +5,208 @@
 #include <pthread.h>
 #include <time.h>
 
+#include "inst_decoder.h"
+
+#define GET_RFLAGS(flag) ((cpu.rflags & flag) / flag)
+
 extern x64_CPU cpu;
+
 extern uint8_t* ram;
 extern uint8_t* disk;
 extern const uint64_t DISK_CAPACITY;
+
 extern pthread_mutex_t io_ports_mutex;
+extern pthread_mutex_t irq_queue_mutex;
+
+extern uint64_t read_unsigned(uint8_t*, uint8_t);
+extern void exe_push(uint8_t*, uint8_t);
+
+// ********** //
+// ** PS/2 ** //
+// ********** //
+
+#define PS2_DATA           0x60
+#define PS2_STATUS_COMMAND 0x64
+
+#define OUTPUT_QUEUE_SIZE 64
+
+typedef enum { PS2_WAITING_COMMAND, WRITE_TO_MOUSE, WRITE_CONFIG_BYTE, GET_SCANCODE_SET_INDEX, GET_LED_CONTROL_BYTE } PS2_State;
+typedef enum { MS_WAITING_COMMAND, MS_READ_RES, MS_READ_SAMPLE_RATE } MouseState;
+
+typedef struct {
+  uint8_t sample_rate;
+  uint8_t res;
+  MouseState state;
+}
+Mouse;
+
+typedef struct {
+  uint8_t output_queue[OUTPUT_QUEUE_SIZE];
+  uint8_t queue_top;
+  uint8_t queue_bot;
+  uint8_t status;
+  uint8_t config;
+
+  Mouse ms;
+
+  PS2_State state;
+}
+PS2_Controller;
+
+extern PS2_Controller ps2;
+
+void enqueue_output(uint8_t byte) {
+  ps2.status |= 0x1;
+  ps2.output_queue[ps2.queue_top] = byte;
+  ps2.queue_top = (ps2.queue_top + 1) % OUTPUT_QUEUE_SIZE;
+  if( ps2.queue_top == ps2.queue_bot )
+    panic("OUTPUT queue overflow!");
+}
+
+uint8_t dequeue_output(void) {
+  const uint8_t byte = ps2.output_queue[ps2.queue_bot];
+  ps2.queue_bot = (ps2.queue_bot + 1) % OUTPUT_QUEUE_SIZE;
+  if( ps2.queue_top == ps2.queue_bot )
+    ps2.status &= ~0x1;
+  return byte;
+}
+
+void PS2_send_bytes(void) {
+  if( (ps2.status & 0x1) == 0 )
+    return;
+  cpu.io_ports[PS2_DATA] = dequeue_output();
+}
+
+void PS2_send_status(void) {
+  cpu.io_ports[PS2_STATUS_COMMAND] = ps2.status;
+}
+
+void PS2_command(void) {
+  if( ps2.state != PS2_WAITING_COMMAND )
+    panic("PS2 must be in PS2_WAITING_COMMAND to process commands!");
+  switch( cpu.io_ports[PS2_STATUS_COMMAND] ) {
+    case 0x20: {
+      // READ CONFIG BYTE
+      enqueue_output(ps2.config);
+    } break;
+    case 0x60: {
+      // WRITE CONFIG BYTE
+      ps2.state = WRITE_CONFIG_BYTE;
+    } break;
+    case 0xA7: break; // DISABLE SECOND PORT
+    case 0xA8: break; // ENABLE SECOND PORT
+    case 0xAD: break; // DISABLE FIRST PORT
+    case 0xAE: break; // ENABLE FIRST PORT
+    case 0xD4: {
+      // WRITE BYTE TO INPUT BUFFER
+      ps2.status &= ~0x8;
+      ps2.state = WRITE_TO_MOUSE;
+    } break;
+    default: panic("PS2 cannot process 0x%x commands from COMMAND!", cpu.io_ports[PS2_STATUS_COMMAND]);
+  }
+}
+
+void PS2_mouse_receive_bytes(void) {
+  switch( ps2.ms.state ) {
+    case MS_WAITING_COMMAND: {
+      switch( cpu.io_ports[PS2_DATA] ) {
+        case 0xE6: {
+          // DISABLE SCALING
+          enqueue_output(0xFA);
+          return;
+        }
+        case 0xE8: {
+          // SET RESOLUTION
+          ps2.ms.state = MS_READ_RES;
+          enqueue_output(0xFA);
+          return;
+        }
+        case 0xF2: {
+          // GET MOUSE ID
+          enqueue_output(0xFA);
+          enqueue_output(0x00);
+          return;
+        }
+        case 0xF3: {
+          // SET SAMPLE RATE
+          ps2.ms.state = MS_READ_SAMPLE_RATE;
+          enqueue_output(0xFA);
+          return;
+        }
+        case 0xF4: {
+          // START RECORDING
+          enqueue_output(0xFA);
+          return;
+        }
+        case 0xFF: {
+          // RESET MOUSE
+          enqueue_output(0xFA); // ack
+          enqueue_output(0xAA); // self-test passed
+          enqueue_output(0x00); // id
+          return;
+        }
+        default: panic("Mouse cannot process 0x%x commands!", cpu.io_ports[PS2_DATA]);
+      }
+    }
+    case MS_READ_RES: {
+      ps2.ms.res = cpu.io_ports[PS2_DATA];
+      ps2.ms.state = MS_WAITING_COMMAND;
+      enqueue_output(0xFA);
+      return;
+    }
+    case MS_READ_SAMPLE_RATE: {
+      ps2.ms.sample_rate = cpu.io_ports[PS2_DATA];
+      ps2.ms.state = MS_WAITING_COMMAND;
+      enqueue_output(0xFA);
+      return;
+    }
+    default: panic("Unhandled case in PS2_mouse_receive_bytes!");
+  }
+}
+
+void PS2_receive_bytes(void) {
+  switch( ps2.state ) {
+    case PS2_WAITING_COMMAND: {
+      switch( cpu.io_ports[PS2_DATA] ) {
+        case 0xF0: { 
+          // SELECT SCANCODE SET
+          ps2.state = GET_SCANCODE_SET_INDEX;
+          return;
+        }
+        case 0xED: {
+          // CONTROL LEDs
+          ps2.state = GET_LED_CONTROL_BYTE;
+          return;
+        }
+        default: panic("PS2 cannot process 0x%x commands from DATA!", cpu.io_ports[PS2_DATA]);
+      }
+    }
+    case WRITE_TO_MOUSE: {
+      if( ps2.status & 0x2 )
+        panic("Cannot write to mouse as the input buffer is full!");
+      PS2_mouse_receive_bytes();
+      ps2.status |= 0x8;
+      ps2.state = PS2_WAITING_COMMAND;
+      return;
+    }
+    case WRITE_CONFIG_BYTE: {
+      ps2.config = cpu.io_ports[PS2_DATA];
+      ps2.state = PS2_WAITING_COMMAND;
+      return;
+    }
+    case GET_SCANCODE_SET_INDEX: {
+      if( cpu.io_ports[PS2_DATA] != 0x02 )
+        panic("Attempt to change scancode set 2 for %d!", cpu.io_ports[PS2_DATA]);
+      ps2.state = PS2_WAITING_COMMAND;
+      return;
+    }
+    case GET_LED_CONTROL_BYTE: {
+      ps2.state = PS2_WAITING_COMMAND;
+      return;
+    }
+    default: panic("unhandled case in PS2_receive_bytes!");
+  }
+}
 
 // *********** //
 // ** ATAPI ** //
@@ -199,11 +396,78 @@ extern Dual_PIC dual_pic;
 // on IN al, 0x21 | 0xA1:
 // if state is WAITING_COMMAND -> write mask
 
+void PIC_process_irqs(void) {
+  if( GET_RFLAGS(RFLAGS_IF) == 0 ) return;
+  if( dual_pic.processing_int ) return;
+  
+  pthread_mutex_lock(&irq_queue_mutex);
+
+  if( dual_pic.queue_bot == dual_pic.queue_top ) {
+    pthread_mutex_unlock(&irq_queue_mutex);
+    return;
+  }
+  
+  const uint8_t line = dual_pic.irq_queue[dual_pic.queue_bot];
+  dual_pic.queue_bot = (dual_pic.queue_bot + 1) % IRQ_QUEUE_SIZE;
+
+  pthread_mutex_unlock(&irq_queue_mutex);
+
+  if( !(op_mode == LONG_MODE && cpu.cs_cache.l) )
+    panic("PIC can only process irqs in 64-bit mode!");
+  if( line > 15 )
+    panic("0 <= IRQ line <= 15 !");
+
+  //panic("INT!!");
+  const uint8_t vector = line + (line <= 7 ? dual_pic.pic1.idt_index : dual_pic.pic2.idt_index);
+  uint8_t* int_desc_addr = ram + cpu.idtr.base + 16*vector;
+  const uint64_t int_desc_low  = read_unsigned(int_desc_addr, 8);
+  const uint64_t int_desc_high = read_unsigned(int_desc_addr + 8, 8);
+
+  if( ((int_desc_low >> 40) & 0b1111) != 0xE )
+    panic("PIC can only handle interrupt gates!");
+
+  if( ((int_desc_low >> 32) & 0b111) != 0 )
+    panic("PIC does not support the Interrupt Stack Table!");
+
+  const uint64_t segment = (int_desc_low >> 16) & 0xFFFF;
+  const uint64_t offset = (int_desc_high << 32) + ((int_desc_low >> 48) << 16) + (int_desc_low & 0xFFFF);
+
+  const uint64_t ss = read_unsigned(&(cpu.ss), 2);
+  const uint64_t cs = read_unsigned(&(cpu.cs), 2);
+  const uint64_t temp_rsp = cpu.rsp;
+  exe_push(&ss, 8);
+  exe_push(&temp_rsp, 8);
+  exe_push(&(cpu.rflags), 8);
+  exe_push(&cs, 8);
+  exe_push(&(cpu.rip), 8);
+
+  set_seg_reg(CS, segment);
+  cpu.rip = offset;
+  dual_pic.processing_int = 1;
+}
+
+void IRQ(uint8_t line) {
+  if( GET_RFLAGS(RFLAGS_IF) == 0 ) return;
+  pthread_mutex_lock(&irq_queue_mutex);
+
+  dual_pic.irq_queue[dual_pic.queue_top] = line;
+  dual_pic.queue_top = (dual_pic.queue_top + 1) % IRQ_QUEUE_SIZE;
+  if( dual_pic.queue_top == dual_pic.queue_bot )
+    panic("IRQ queue overflow!");
+
+  pthread_mutex_unlock(&irq_queue_mutex);
+}
+
 void PIC1_process_command(void) {
   switch( dual_pic.pic1.state ) {
     case WAITING_COMMAND: {
-      if( cpu.io_ports[PIC1_COMMAND] != 0x11 ) panic("PIC1 can only process 0x11 commands!");
-      dual_pic.pic1.state = READ_IDT_INDEX;
+      switch( cpu.io_ports[PIC1_COMMAND] ) {
+        case 0x11: {
+          dual_pic.pic1.state = READ_IDT_INDEX;
+        } break;
+        case 0x20: break; // End Of Interrupt
+        default: panic("PIC1 cannot process 0x%x commands!", cpu.io_ports[PIC1_COMMAND]);
+      }
     } break;
     default: panic("PIC1 only processes commands in WAITING_COMMAND!");
   }
@@ -212,8 +476,13 @@ void PIC1_process_command(void) {
 void PIC2_process_command(void) {
   switch( dual_pic.pic2.state ) {
     case WAITING_COMMAND: {
-      if( cpu.io_ports[PIC2_COMMAND] != 0x11 ) panic("PIC2 can only process 0x11 commands!");
-      dual_pic.pic2.state = READ_IDT_INDEX;
+      switch( cpu.io_ports[PIC2_COMMAND] ) {
+        case 0x11: {
+          dual_pic.pic2.state = READ_IDT_INDEX;
+        } break;
+        case 0x20: break;
+        default: panic("PIC2 cannot process 0x%x commands!", cpu.io_ports[PIC2_COMMAND]);
+      }
     } break;
     default: panic("PIC2 only processes commands in WAITING_COMMAND!");
   }
@@ -274,6 +543,15 @@ void PIC2_write_mask(void) {
       cpu.io_ports[PIC2_DATA] = dual_pic.pic2.mask;
     } break;
     default: panic("PIC2 unhandled case in write_mask!");
+  }
+}
+
+void PIC1_write_IRR(void) {
+  switch( dual_pic.pic1.state ) {
+    case WAITING_COMMAND: {
+      cpu.io_ports[PIC1_COMMAND] = 0;
+    } break;
+    default: panic("PIC1 unhandled case in write_ISR!");
   }
 }
 
@@ -420,7 +698,7 @@ void PIT_update_counter(void) {
   --pit.chan0.counter;
   if( pit.chan0.counter == 0 ) {
     pit.chan0.counter = pit.chan0.reload_value;
-    // send IRQ0
+    IRQ(0);
   }
 }
 
@@ -450,16 +728,124 @@ void update_RTC(void) {
 // ** VGA ** //
 // ********* //
 
-static void render_vram(SDL_Renderer* renderer, uint8_t* vram, const SDL_Color* palette) {
+typedef enum { VGA_READ_RED, VGA_READ_GREEN, VGA_READ_BLUE } DAC_State;
+typedef enum { VGA_READ_INDEX, VGA_WRITE_COLOR_PALETTE, VGA_WRITE_HORIZONTAL_PIXEL_PANNING } AttributeReg_State;
+
+typedef struct {
+  uint8_t vram[640*480];
+  SDL_Color palette[16];
+  uint8_t plane_selector;
+  uint8_t color_index;
+  uint8_t attb_color_index;
+
+  DAC_State dac_state;
+  AttributeReg_State attb_state;
+}
+VGA_Controller;
+
+extern VGA_Controller vga;
+
+const SDL_Color EGA_palette[] = {
+  {0, 0, 0, 255},       // Black
+  {0, 0, 128, 255},     // DarkBlue
+  {0, 128, 0, 255},     // DarkGreen
+  {0, 128, 128, 255},   // Teal
+  {128, 0, 0, 255},     // DarkRed
+  {128, 0, 128, 255},   // Purple
+  {128, 128, 0, 255},   // Brown
+  {192, 192, 192, 255}, // Silver
+  {128, 128, 128, 255}, // Gray
+  {0, 0, 255, 255},     // Blue
+  {0, 255, 0, 255},     // Green
+  {0, 255, 255, 255},   // Cyan
+  {255, 0, 0, 255},     // Red
+  {255, 0, 255, 255},   // Magenta
+  {255, 255, 0, 255},   // Yellow
+  {255, 255, 255, 255}  // White
+};
+
+static void VGA_reset_attribute_register(void) {
+  vga.attb_state = VGA_READ_INDEX;
+}
+
+static void VGA_attribute_register_receive_bytes(void) {
+  switch( vga.attb_state ) {
+    case VGA_READ_INDEX: {
+      switch( cpu.io_ports[0x3C0] ) {
+        case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
+        case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15: {
+          // SET COLOR PALETTE AT INDEX IN 0x3C0
+          vga.attb_color_index = cpu.io_ports[0x3C0];
+          vga.attb_state = VGA_WRITE_COLOR_PALETTE;
+        } break;
+        case 0x20: {
+          // SET HORIZONTAL PIXEL PANNING
+          vga.attb_state = VGA_WRITE_HORIZONTAL_PIXEL_PANNING;
+        } break;
+        default: panic("VGA attribute reg cannot process 0x%x commands", cpu.io_ports[0x3C0]);
+      }
+    } break;
+    case VGA_WRITE_COLOR_PALETTE: {
+      vga.palette[ vga.attb_color_index ] = EGA_palette[ cpu.io_ports[0x3C0] ];
+      vga.attb_state = VGA_READ_INDEX;
+    } break;
+    case VGA_WRITE_HORIZONTAL_PIXEL_PANNING: {
+      if( cpu.io_ports[0x3C0] != 0 )
+        panic("VGA attempt to set horizontal pixel panning to not zero!");
+      vga.attb_state = VGA_READ_INDEX;
+    } break;
+    default:
+  }
+}
+
+static void VGA_get_palette_index(void) {
+  vga.color_index = cpu.io_ports[0x3C8];
+  vga.dac_state = VGA_READ_RED;
+}
+
+static void VGA_receive_color_bytes(void) {
+  switch( vga.dac_state ) {
+    case VGA_READ_RED: {
+      vga.palette[vga.color_index].r = (uint64_t)cpu.io_ports[0x3C9]*255/63;
+      vga.dac_state = VGA_READ_GREEN;
+    } break;
+    case VGA_READ_GREEN: {
+      vga.palette[vga.color_index].g = (uint64_t)cpu.io_ports[0x3C9]*255/63;
+      vga.dac_state = VGA_READ_BLUE;
+    } break;
+    case VGA_READ_BLUE: {
+      vga.palette[vga.color_index].b = (uint64_t)cpu.io_ports[0x3C9]*255/63;
+      vga.dac_state = VGA_READ_RED;
+      vga.color_index = (vga.color_index + 1) % 16;
+    } break;
+    default:
+  }
+}
+
+static void VGA_update_plane_selector(void) {
+  vga.plane_selector = cpu.io_ports[0x3C5];
+}
+
+static void VGA_update_vram(uint8_t* addr) {
+  const uint8_t byte = *addr;
+  
+  uint8_t mask = 0x80;
+  uint8_t* ptr = vga.vram + (uint64_t)(addr - (ram + 0xA0000))*8;
+  for(uint64_t i = 0; i < 8; ++i) {
+    *ptr = mask & byte ? *ptr | vga.plane_selector : *ptr & ~vga.plane_selector;
+    mask >>= 1;
+    ++ptr;
+  }
+}
+
+static void VGA_render_vram(SDL_Renderer* renderer) {
   uint32_t i = 0;
   for(uint32_t y = 0; y < 480; ++y) {
     for(uint32_t x = 0; x < 640; ++x) {
-      //const uint32_t color_index = i & 0x1 ? vram[i/2] >> 4 : vram[i/2] & 0b1111;
-      //const SDL_Color color = palette[color_index];
-      const uint8_t color = 255 * (( vram[i/8] >> (7 - (i%8)) ) & 1);
+      const SDL_Color color = vga.palette[ vga.vram[i] ];
       ++i;
 
-      SDL_SetRenderDrawColor(renderer, color, color, color, 255);//color.r, color.g, color.b, color.a);
+      SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, 255);
       SDL_RenderDrawPoint(renderer, x, y);
     }
   }
@@ -472,27 +858,6 @@ void* io_thread(void* arg) {
   SDL_Init(SDL_INIT_VIDEO);
   SDL_CreateWindowAndRenderer(640, 480, 0, &window, &renderer);
 
-  const SDL_Color palette[16] = {
-    {0, 0, 0, 255},       // Black
-    {0, 0, 128, 255},     // DarkBlue
-    {0, 128, 0, 255},     // DarkGreen
-    {0, 128, 128, 255},   // Teal
-    {128, 0, 0, 255},     // DarkRed
-    {128, 0, 128, 255},   // Purple
-    {128, 128, 0, 255},   // Brown
-    {192, 192, 192, 255}, // Silver
-    {128, 128, 128, 255}, // Gray
-    {0, 0, 255, 255},     // Blue
-    {0, 255, 0, 255},     // Green
-    {0, 255, 255, 255},   // Cyan
-    {255, 0, 0, 255},     // Red
-    {255, 0, 255, 255},   // Magenta
-    {255, 255, 0, 255},   // Yellow
-    {255, 255, 255, 255}  // White
-  };
-
-  uint8_t* vram = ram + 0xA0000;
-
   SDL_Event event;
   uint8_t running = 1;
 
@@ -504,7 +869,7 @@ void* io_thread(void* arg) {
     }
 
     SDL_RenderClear(renderer);
-    render_vram(renderer, vram, palette);
+    VGA_render_vram(renderer);
     SDL_RenderPresent(renderer);
 
     SDL_Delay(33);

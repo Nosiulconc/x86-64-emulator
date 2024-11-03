@@ -22,6 +22,8 @@ x87_FPU fpu;
 PIT pit;
 Dual_PIC dual_pic;
 Drive drive;
+PS2_Controller ps2;
+VGA_Controller vga;
 
 // NOTE: RAM capacity has to be 2MB aligned or else it crashes, it is a limitation of TOS
 const uint64_t RAM_CAPACITY = 16*0x200000;
@@ -31,6 +33,7 @@ uint8_t* ram;
 uint8_t* disk;
 
 pthread_mutex_t io_ports_mutex;
+pthread_mutex_t irq_queue_mutex;
 
 uint64_t panic_rip = 0;
 
@@ -161,6 +164,24 @@ static void setup_drive(void) {
   drive.state = DRIVE_WAITING_COMMAND;
 }
 
+static void setup_PS2_controller(void) {
+  ps2.queue_top = ps2.queue_bot = 0;
+  ps2.status = 0b00001100;
+  ps2.config = 0b00110100;
+  ps2.ms.state = MS_WAITING_COMMAND;
+  ps2.state = PS2_WAITING_COMMAND;
+}
+
+static void setup_VGA_controller(void) {
+  memset(vga.vram, 0, 640*480);
+  memcpy(vga.palette, EGA_palette, sizeof(EGA_palette));
+  vga.plane_selector = 0b1111;
+  vga.color_index = 0;
+  vga.attb_color_index = 0;
+  vga.dac_state = VGA_READ_RED;
+  vga.attb_state = VGA_READ_INDEX;
+}
+
 // Thanks to https://wiki.osdev.org/BIOS32 
 static void setup_BIOS32(void) {
   uint8_t* BIOS32_ptr = ram + 0xE0000;
@@ -222,6 +243,7 @@ static void tick(void) {
   //if( cpu.rip == 0xE071 )
   //  panic("found!");
   PIT_update_counter();
+  PIC_process_irqs();
 }
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
@@ -351,6 +373,7 @@ static void draw_regwin(void) {
 }
 
 static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
+  werase(win);
   box(win, 0, 0);
 
   const int32_t regs_x = 1 + (width - 2 - 28) / 2;
@@ -362,6 +385,8 @@ static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
 
   mvwprintw(win, 10, 2, "TOP:%01hhx", get_fpu_top());
   mvwprintw(win, 10, 8, "%10.11Lf", val_st(0));
+
+  mvwprintw(win, 12, 2, "PIT: fq=%uHz cnt=%u", 1193182 / pit.chan0.reload_value, pit.chan0.counter);
   wrefresh(win);
 }
 
@@ -400,6 +425,16 @@ static int32_t get_input_hex(WINDOW* hexwin, int32_t hex_width, int32_t hex_heig
   return 0;
 }
 
+void print_bytes_at_rip(void) {
+  uint8_t* rip_addr = ram + get_flat_address(CS, panic_rip);
+  printf("BYTES:");
+  for(uint64_t i = 0; i < 16; ++i) {
+    printf(" %02x", *rip_addr);
+    ++rip_addr;
+  }
+  printf("\n");
+}
+
 void panic(const char* fmt, ...) {
   draw_regwin();
   endwin();
@@ -413,6 +448,8 @@ void panic(const char* fmt, ...) {
   
   printf("\n");
 
+  printf("PIT: reload=%u, counter=%u\n", pit.chan0.reload_value, pit.chan0.counter);
+  print_bytes_at_rip();
   print_stack_trace();
 
   exit(1);
@@ -424,10 +461,13 @@ int32_t main(void) {
   init_cpu();
 
   pthread_mutex_init(&io_ports_mutex, NULL);
-  create_io_thread();
+  pthread_mutex_init(&irq_queue_mutex, NULL);
   setup_PIT();
   setup_PIC();
   setup_drive();
+  setup_PS2_controller();
+  setup_VGA_controller();
+  create_io_thread();
 
   setup_BIOS32();
   const uint64_t iso_size = load_file_into_disk("./TempleOS.iso", disk);
@@ -550,9 +590,11 @@ int32_t main(void) {
         if( get_input_hex(hexwin, hex_width, hex_height, &addr) )
           goto exit_run_until;
 
+        //const uint64_t tmp = inst_counter;
         while( get_flat_address(CS, get_ip()) != addr ) {
           tick();
           ++inst_counter;
+          //if( inst_counter - tmp == 100000000 ) break;
         }
 
       exit_run_until:
@@ -569,6 +611,7 @@ int32_t main(void) {
   print_stack_trace();
 
   pthread_mutex_destroy(&io_ports_mutex);
+  pthread_mutex_destroy(&irq_queue_mutex);
 
   return 0;
 }
