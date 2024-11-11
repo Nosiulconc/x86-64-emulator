@@ -826,15 +826,17 @@ static void VGA_update_plane_selector(void) {
   vga.plane_selector = cpu.io_ports[0x3C5];
 }
 
-static void VGA_update_vram(uint8_t* addr) {
-  const uint8_t byte = *addr;
-  
-  uint8_t mask = 0x80;
-  uint8_t* ptr = vga.vram + (uint64_t)(addr - (ram + 0xA0000))*8;
-  for(uint64_t i = 0; i < 8; ++i) {
-    *ptr = mask & byte ? *ptr | vga.plane_selector : *ptr & ~vga.plane_selector;
-    mask >>= 1;
-    ++ptr;
+static void VGA_update_vram(uint8_t* addr, uint8_t size) {
+  for(uint64_t j = 0; j < size; ++j) {
+    uint8_t byte = *addr;
+    uint8_t mask = 0x80;
+    uint8_t* ptr = vga.vram + (uint64_t)(addr - (ram + 0xA0000))*8;
+    for(uint64_t i = 0; i < 8; ++i) {
+      *ptr = mask & byte ? *ptr | vga.plane_selector : *ptr & ~vga.plane_selector;
+      mask >>= 1;
+      ++ptr;
+    }
+    ++addr;
   }
 }
 

@@ -26,7 +26,7 @@ PS2_Controller ps2;
 VGA_Controller vga;
 
 // NOTE: RAM capacity has to be 2MB aligned or else it crashes, it is a limitation of TOS
-const uint64_t RAM_CAPACITY = 16*0x200000;
+const uint64_t RAM_CAPACITY =  16*0x200000;
 const uint64_t DISK_CAPACITY = 16*0x200000;
 
 uint8_t* ram;
@@ -228,6 +228,8 @@ String assembly = { 28, str };
 uint64_t phyaddr = 0;
 char* phyaddr_seg = "--";
 
+uint64_t loop_addr = 0, loop_count = 0;
+
 FunctionCall stack_trace[64];
 uint64_t stack_trace_top = 0;
 
@@ -387,6 +389,8 @@ static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 10, 8, "%10.11Lf", val_st(0));
 
   mvwprintw(win, 12, 2, "PIT: fq=%uHz cnt=%u", 1193182 / pit.chan0.reload_value, pit.chan0.counter);
+
+  mvwprintw(win, 14, 2, "loop: addr=%016lu cnt=%lu", loop_addr, loop_count);
   wrefresh(win);
 }
 
@@ -590,11 +594,21 @@ int32_t main(void) {
         if( get_input_hex(hexwin, hex_width, hex_height, &addr) )
           goto exit_run_until;
 
-        //const uint64_t tmp = inst_counter;
         while( get_flat_address(CS, get_ip()) != addr ) {
           tick();
           ++inst_counter;
-          //if( inst_counter - tmp == 100000000 ) break;
+	  if( inst_counter > 1200000000 ) break;
+	  // if( phyaddr >= 0xA0000 && phyaddr <= 0xAFFFF ) break;
+	  // if( (stack_trace[stack_trace_top - 1].function_addr == 0x1473E && inst_counter > 782512703) || inst_counter > 1000000000 )
+          //  break;
+	  // if( (phyaddr == 0xBAB0 && inst_counter > 782512703) || inst_counter > 1000000000 ) break;
+	  // MILESTONES:
+	  // count 782 450 918: Raw(OFF) (0x16BF6) in DocTermNew
+	  // count 782 471 814: TaskValidate(...) (0x1CF7B) in WinVert
+	  // count 782 512 703: TaskInit(...) (0x1D353) in Spawn
+	  // count ???        : sys_os_version (0xBAB0) in RegInit
+	  // count ???        : StrPrint (0x1473E) in RegInit
+	  // count ???        : TaskDerivedValsUpdate (0x1D72B) in WallPaperInit
         }
 
       exit_run_until:

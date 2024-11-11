@@ -25,9 +25,6 @@
 
 #define GET_MSB(val, size) ((val >> (size - 1)) & 0x1)
 
-#define LOG2_10 "\xFE\x8A\x1B\xCD\x4B\x78\x9A\xD4\x00\x40"
-#define LOG10_2 "\x99\xF7\xCF\xFB\x84\x9A\x20\x9A\xFD\x3F"
-
 #define MODRM(var, imm_sz)                                       \
   char tmp[64]; String modrm = { 63, tmp }; ModRM_Info info;     \
   ++(cpu.rip);                                                   \
@@ -801,7 +798,7 @@ static void exe_mov(uint8_t* dest_addr, uint8_t* src_addr, uint8_t size) {
     memset(dest_addr + 4, 0, 4);
   memcpy(dest_addr, src_addr, size);
   if( dest_addr >= ram + 0xA0000 && dest_addr <= ram + 0xAFFFF )
-    VGA_update_vram(dest_addr);
+    VGA_update_vram(dest_addr, size);
 }
 
 static void exe_add(uint8_t* dest_addr, uint8_t dest_sz, int64_t a, int64_t b) {
@@ -901,7 +898,16 @@ static uint8_t eval_cond(uint8_t flag, uint8_t negate) {
   return negate ? !cond : cond;
 }
 
+extern uint64_t loop_addr;
+extern uint64_t loop_count;
+
 static void exe_jcc(uint8_t flag, uint8_t negate, int64_t disp) {
+  if( loop_addr == get_flat_address(CS, get_ip()) ) {
+    ++loop_count;
+  } else {
+    loop_addr = get_flat_address(CS, get_ip());
+    loop_count = 0;
+  }
   if( eval_cond(flag, negate) )
     cpu.rip += disp;
 }
@@ -1085,6 +1091,18 @@ static void exe_shl(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b)
     update_zf_flag(c);
     update_pf_flag(c);
   }
+}
+
+static void exe_ror(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
+  uint64_t c = a;
+  for(uint64_t i = 0; i < b; ++i) {
+    const uint64_t cf = c & 0x1;
+    UPDATE_FLAG(cf, RFLAGS_CF)
+    c = (c >> 1) | (cf << (dest_sz*8 - 1));
+  }
+  exe_mov(dest_addr, &c, dest_sz);
+  
+  if( b == 1 ) { UPDATE_FLAG(GET_MSB(c, dest_sz*8) ^ GET_MSB(c, dest_sz*8 - 1), RFLAGS_OF) }
 }
 
 static void exe_int(uint64_t vector) {
@@ -1418,6 +1436,10 @@ static void exe_xchg(uint8_t* addr1, uint8_t* addr2, uint8_t operand_sz) {
   exe_mov(addr2, &tmp, operand_sz);
 }
 
+static void exe_xlat(uint8_t* addr) {
+  exe_mov(&(cpu.al), addr, 1);
+}
+
 // ********************** //
 // ** FPU INSTRUCTIONS ** //
 // ********************** //
@@ -1520,6 +1542,10 @@ static void exe_fsub(f80_t imm) {
   store_fpu_st(0, val_st(0) - imm);
 }
 
+static void exe_fsubr(f80_t imm) {
+  store_fpu_st(0, imm - val_st(0));
+}
+
 static void exe_fmul(f80_t imm) {
   store_fpu_st(0, val_st(0) * imm);
 }
@@ -1547,6 +1573,11 @@ static void exe_faddp(void) {
 static void exe_fsubrp(void) {
   store_fpu_st(1, val_st(0) - val_st(1));
   pop_fpu();
+}
+
+static void exe_fsqrt(void) {
+  if( val_st(0) < 0 ) panic("FSQRT cannot take the root of negative numbers!");
+  store_fpu_st(0, sqrtl(val_st(0)));
 }
 
 static uint8_t get_fpu_control_rc(void) {
@@ -2409,6 +2440,11 @@ static void decode_one_byte_opcode(String assembly) {
       ++(cpu.rip);
 
       switch( info.ext_opcode ) {
+	case 1: {
+          snprintf(str, len, "ROR  %s, 0x%lx", modrm.str, b); 
+          exe_ror(dest_addr, operand_sz, a, b);
+          return;
+	}
         case 4: {
           snprintf(str, len, "SHL  %s, 0x%lx", modrm.str, b); 
           exe_shl(dest_addr, operand_sz, a, b);
@@ -2548,6 +2584,17 @@ static void decode_one_byte_opcode(String assembly) {
         default: panic("Subop of 0xD3 not implemented!");
       }
     }
+    case 0xD7: {
+      const uint8_t addr_sz = address_sz();
+      const uint64_t rbx = read_unsigned(get_reg_addr(RBX, addr_sz), addr_sz);
+      uint8_t* addr = ram + get_flat_address(overridable_segment(DS), rbx + cpu.al);
+      ++(cpu.rip);
+
+      snprintf(str, len, "XLAT  %s:[%s+al]", overridable_segment_str(DS),
+                                             get_reg_str(RBX, addr_sz));
+      exe_xlat(addr);
+      return;
+    }
     case 0xD9: {
       switch( *(opcode+1) ) {
         case 0xE0: {
@@ -2565,15 +2612,25 @@ static void decode_one_byte_opcode(String assembly) {
         case 0xE9: {
           cpu.rip += 2;
           snprintf(str, len, "FLDL2T");
-          f80_t src; memcpy(&src, LOG2_10, 10);
-          exe_load_fpu(src);
+          exe_load_fpu( log2l(10) );
+          return;
+        }
+        case 0xEA: {
+          cpu.rip += 2;
+          snprintf(str, len, "FLDL2E");
+          exe_load_fpu( log2l(expl(1)) );
           return;
         }
         case 0xEC: {
           cpu.rip += 2;
           snprintf(str, len, "FLDLG2");
-          f80_t src; memcpy(&src, LOG10_2, 10);
-          exe_load_fpu(src);
+          exe_load_fpu( log10l(2) );
+          return;
+        }
+        case 0xEE: {
+          cpu.rip += 2;
+          snprintf(str, len, "FLDZ");
+          exe_load_fpu(0);
           return;
         }
         case 0xF0: {
@@ -2594,6 +2651,12 @@ static void decode_one_byte_opcode(String assembly) {
           exe_fincstp();
           return;
         }
+        case 0xFA: {
+          cpu.rip += 2;
+          snprintf(str, len, "FSQRT");
+          exe_fsqrt();
+          return;
+        }
         case 0xFC: {
           cpu.rip += 2;
           snprintf(str, len, "FRNDINT");
@@ -2606,6 +2669,7 @@ static void decode_one_byte_opcode(String assembly) {
           exe_fscale();
           return;
         }
+        default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xD9 not implemented!");
       }
 
       const uint8_t operand_sz = fpu_operand_sz();
@@ -2623,7 +2687,7 @@ static void decode_one_byte_opcode(String assembly) {
           return;
         }
       }
-      panic("Subop of 0xD9 not implemented!");
+      panic("Subop (2) of 0xD9 not implemented!");
     }
     case 0xDB: {
       if( *(opcode+1) == 0xE3 ) {
@@ -2657,6 +2721,12 @@ static void decode_one_byte_opcode(String assembly) {
           exe_fsub(imm);
           return;
         }
+        case 5: {
+          snprintf(str, len, "FSUBR  %s", modrm.str);
+          const f80_t imm = *(f64_t*)modrm_addr;
+          exe_fsubr(imm);
+          return;
+        }
         case 6: {
           snprintf(str, len, "FDIV  %s", modrm.str);
           const f80_t imm = *(f64_t*)modrm_addr;
@@ -2687,6 +2757,7 @@ static void decode_one_byte_opcode(String assembly) {
           exe_ffree( *(opcode+1) & 0b111 );
           return;
         }
+		default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xDD not implemented!");
       }
 
       const uint8_t operand_sz = fpu_operand_sz();
@@ -2720,7 +2791,7 @@ static void decode_one_byte_opcode(String assembly) {
           return;
         }
       }
-      panic("Subop of 0xDD not implemented!");
+      panic("Subop (2) of 0xDD not implemented!");
     }
     case 0xDE: {
       switch( *(opcode+1) ) {
@@ -2762,6 +2833,7 @@ static void decode_one_byte_opcode(String assembly) {
           exe_fcomip(disp);
           return;
         }
+		default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xDF not implemented!");
       }
 
       switch( get_ext_opcode_in_modrm(opcode+1) ) {
@@ -2775,7 +2847,7 @@ static void decode_one_byte_opcode(String assembly) {
           return;
         }
       }
-      panic("Subop of 0xDF not implemented!");
+      panic("Subop (2) of 0xDF not implemented!");
     }
     case 0xE2: {
       const int64_t disp = read_signed(opcode+1, 1);
