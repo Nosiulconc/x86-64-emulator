@@ -26,7 +26,7 @@ PS2_Controller ps2;
 VGA_Controller vga;
 
 // NOTE: RAM capacity has to be 2MB aligned or else it crashes, it is a limitation of TOS
-const uint64_t RAM_CAPACITY =  16*0x200000;
+const uint64_t RAM_CAPACITY =  256*0x200000;
 const uint64_t DISK_CAPACITY = 16*0x200000;
 
 uint8_t* ram;
@@ -160,6 +160,7 @@ static void setup_PIC(void) {
 }
 
 static void setup_drive(void) {
+  memset(drive.drive_desc, 0, 512);
   drive.status = 0;
   drive.state = DRIVE_WAITING_COMMAND;
 }
@@ -228,8 +229,6 @@ String assembly = { 28, str };
 uint64_t phyaddr = 0;
 char* phyaddr_seg = "--";
 
-uint64_t loop_addr = 0, loop_count = 0;
-
 FunctionCall stack_trace[64];
 uint64_t stack_trace_top = 0;
 
@@ -246,6 +245,141 @@ static void tick(void) {
   //  panic("found!");
   PIT_update_counter();
   PIC_process_irqs();
+}
+
+typedef struct {
+  x64_CPU cpu;
+  OperationMode op_mode;
+  uint64_t inst_counter;
+  
+  x87_FPU fpu;
+  PIT pit;
+  Dual_PIC dual_pic;
+  Drive drive;
+  PS2_Controller ps2;
+  VGA_Controller vga;
+  
+  uint64_t panic_rip;
+  
+  char str[29];
+  
+  uint64_t phyaddr;
+  char* phyaddr_seg;
+  
+  FunctionCall stack_trace[64];
+  uint64_t stack_trace_top;
+}
+EmulatorState;
+
+static void save_emulator_state(const char* path) {
+  EmulatorState emu_state = {
+    .cpu = cpu,
+    .op_mode = op_mode,
+    .inst_counter = inst_counter,
+  
+    .fpu = fpu,
+    .pit = pit,
+    .dual_pic = dual_pic,
+    .drive = drive,
+    .ps2 = ps2,
+    .vga = vga,
+  
+    .panic_rip = panic_rip,
+  
+    .phyaddr = phyaddr,
+    .phyaddr_seg = phyaddr_seg,
+  
+    .stack_trace_top = stack_trace_top
+  };
+  memcpy(&(emu_state.str), str, 29);
+  memcpy(&(emu_state.stack_trace), stack_trace, 64*sizeof(FunctionCall));
+
+  FILE* file;
+  if( (file = fopen(path, "wb")) == NULL )
+    panic("Couldn't open the file!");
+
+  if( fwrite(&emu_state, sizeof(EmulatorState), 1, file) != 1 ) {
+    puts("Couldn't save the emulator state!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  if( fwrite(ram, RAM_CAPACITY, 1, file) != 1 ) {
+    puts("Couldn't save the ram state!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  if( fwrite(disk, DISK_CAPACITY, 1, file) != 1 ) {
+    puts("Couldn't save the disk state!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  if( fclose(file) == EOF )
+    panic("Couldn't close the file!");
+}
+
+static void load_emulator_state(const char* path) {
+  EmulatorState emu_state;
+
+  FILE* file;
+  if( (file = fopen(path, "rb")) == NULL )
+    panic("Couldn't open the file!");
+
+  if( fread(&emu_state, sizeof(EmulatorState), 1, file) != 1 ) {
+    puts("Couldn't parse emulator state!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  cpu = emu_state.cpu;
+  op_mode = emu_state.op_mode;
+  inst_counter = emu_state.inst_counter;
+  
+  fpu = emu_state.fpu;
+  pit = emu_state.pit;
+  dual_pic = emu_state.dual_pic;
+  drive = emu_state.drive;
+  ps2 = emu_state.ps2;
+  vga = emu_state.vga;
+  
+  panic_rip = emu_state.panic_rip;
+  
+  //phyaddr = emu_state.phyaddr;
+  //phyaddr_seg = emu_state.phyaddr_seg;
+
+  stack_trace_top = emu_state.stack_trace_top;
+
+  memcpy(str, &(emu_state.str), 29);
+  memcpy(stack_trace, &(emu_state.stack_trace), 64*sizeof(FunctionCall));
+
+  if( fread(ram, RAM_CAPACITY, 1, file) != 1 ) {
+    puts("Couldn't parse ram state!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  if( fread(disk, DISK_CAPACITY, 1, file) != 1 ) {
+    puts("Couldn't parse disk state!");
+    if( fclose(file) == EOF )
+      panic("Couldn't close the file!");
+    endwin();
+    exit(1);
+  }
+
+  if( fclose(file) == EOF )
+    panic("Couldn't close the file!");
 }
 
 static void draw_bytes(WINDOW* win, uint8_t* base_addr, uint8_t* bytes, uint64_t rel_addr) {
@@ -291,10 +425,13 @@ static void draw_ctrlwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 5,  2, "down: scroll up");
   mvwprintw(win, 6,  2, "s: save counter");
   
-  mvwprintw(win, 8,  2, "g: goto segment");
-  mvwprintw(win, 9,  2, "j: jump to rip");
-  mvwprintw(win, 10, 2, "e: execute/step");
-  mvwprintw(win, 11, 2, "u: run until");
+  mvwprintw(win, 8,  2, "x: save state");
+  mvwprintw(win, 9,  2, "l: load state");
+
+  mvwprintw(win, 11, 2, "g: goto segment");
+  mvwprintw(win, 12, 2, "j: jump to rip");
+  mvwprintw(win, 13, 2, "e: execute/step");
+  mvwprintw(win, 14, 2, "u: run until");
   wrefresh(win);
 }
 
@@ -389,8 +526,6 @@ static void draw_fpuwin(WINDOW* win, int32_t width, int32_t height) {
   mvwprintw(win, 10, 8, "%10.11Lf", val_st(0));
 
   mvwprintw(win, 12, 2, "PIT: fq=%uHz cnt=%u", 1193182 / pit.chan0.reload_value, pit.chan0.counter);
-
-  mvwprintw(win, 14, 2, "loop: addr=%016lu cnt=%lu", loop_addr, loop_count);
   wrefresh(win);
 }
 
@@ -455,6 +590,8 @@ void panic(const char* fmt, ...) {
   printf("PIT: reload=%u, counter=%u\n", pit.chan0.reload_value, pit.chan0.counter);
   print_bytes_at_rip();
   print_stack_trace();
+
+  save_emulator_state("./crash_state.bin");
 
   exit(1);
 }
@@ -589,6 +726,17 @@ int32_t main(void) {
         save_inst_counter_to_file("./inst_counter.txt");
         break;
       }
+      case 'x': {
+        save_emulator_state("./emu_state.bin");
+	break;
+      }
+      case 'l': {
+        load_emulator_state("./emu_state.bin");
+        draw_hexwin(hexwin, hex_width, hex_height, hex_base_addr, hex_addr);
+        draw_regwin();
+        draw_fpuwin(fpuwin, fpu_width, fpu_height);
+	break;
+      }
       case 'u': {
         uint64_t addr;
         if( get_input_hex(hexwin, hex_width, hex_height, &addr) )
@@ -597,7 +745,7 @@ int32_t main(void) {
         while( get_flat_address(CS, get_ip()) != addr ) {
           tick();
           ++inst_counter;
-	  if( inst_counter > 1200000000 ) break;
+	  // if( inst_counter > 1200000000 ) break;
 	  // if( phyaddr >= 0xA0000 && phyaddr <= 0xAFFFF ) break;
 	  // if( (stack_trace[stack_trace_top - 1].function_addr == 0x1473E && inst_counter > 782512703) || inst_counter > 1000000000 )
           //  break;

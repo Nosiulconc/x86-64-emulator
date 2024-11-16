@@ -898,16 +898,7 @@ static uint8_t eval_cond(uint8_t flag, uint8_t negate) {
   return negate ? !cond : cond;
 }
 
-extern uint64_t loop_addr;
-extern uint64_t loop_count;
-
 static void exe_jcc(uint8_t flag, uint8_t negate, int64_t disp) {
-  if( loop_addr == get_flat_address(CS, get_ip()) ) {
-    ++loop_count;
-  } else {
-    loop_addr = get_flat_address(CS, get_ip());
-    loop_count = 0;
-  }
   if( eval_cond(flag, negate) )
     cpu.rip += disp;
 }
@@ -2119,6 +2110,11 @@ static void decode_one_byte_opcode(String assembly) {
         case 5: {
           snprintf(str, len, "SUB  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
           exe_sub(dest_addr, operand_sz, a, b);
+          return;
+        }
+        case 6: {
+          snprintf(str, len, "XOR  %s, %c0x%lx", modrm.str, pos_neg[b<0], ABS(b));
+          exe_xor(dest_addr, operand_sz, a, b);
           return;
         }
         case 7: {

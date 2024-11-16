@@ -30,7 +30,7 @@ extern void exe_push(uint8_t*, uint8_t);
 
 #define OUTPUT_QUEUE_SIZE 64
 
-typedef enum { PS2_WAITING_COMMAND, WRITE_TO_MOUSE, WRITE_CONFIG_BYTE, GET_SCANCODE_SET_INDEX, GET_LED_CONTROL_BYTE } PS2_State;
+typedef enum { PS2_WAITING_COMMAND, WRITE_TO_MOUSE, WRITE_CONFIG_BYTE, GET_SCANCODE_SET_INDEX, GET_LED_CONTROL_BYTE, SET_TYPING_RATE } PS2_State;
 typedef enum { MS_WAITING_COMMAND, MS_READ_RES, MS_READ_SAMPLE_RATE } MouseState;
 
 typedef struct {
@@ -168,15 +168,21 @@ void PS2_receive_bytes(void) {
   switch( ps2.state ) {
     case PS2_WAITING_COMMAND: {
       switch( cpu.io_ports[PS2_DATA] ) {
+        case 0xED: {
+          // CONTROL LEDs
+          ps2.state = GET_LED_CONTROL_BYTE;
+          return;
+        }
         case 0xF0: { 
           // SELECT SCANCODE SET
           ps2.state = GET_SCANCODE_SET_INDEX;
           return;
         }
-        case 0xED: {
-          // CONTROL LEDs
-          ps2.state = GET_LED_CONTROL_BYTE;
-          return;
+        case 0xF3: {
+          // SET TYPING RATE
+	  ps2.state = SET_TYPING_RATE;
+	  enqueue_output(0xFA);
+	  return;
         }
         default: panic("PS2 cannot process 0x%x commands from DATA!", cpu.io_ports[PS2_DATA]);
       }
@@ -200,7 +206,8 @@ void PS2_receive_bytes(void) {
       ps2.state = PS2_WAITING_COMMAND;
       return;
     }
-    case GET_LED_CONTROL_BYTE: {
+    case GET_LED_CONTROL_BYTE:
+    case SET_TYPING_RATE: {
       ps2.state = PS2_WAITING_COMMAND;
       return;
     }
@@ -223,6 +230,9 @@ void PS2_receive_bytes(void) {
 typedef enum { DRIVE_WAITING_COMMAND, READY_TO_SEND, READY_TO_RECEIVE } DriveState;
 
 typedef struct {
+  uint8_t drive_desc[512];
+  uint8_t packet[12];
+
   uint8_t* buffer;
   uint64_t buffer_size;
   uint8_t* curr_byte;
@@ -232,9 +242,6 @@ typedef struct {
 Drive;
 
 extern Drive drive;
-
-uint8_t drive_desc[512] = { 0 };
-uint8_t packet[12];
 
 void ATAPI_drive_selection(void) {
   if( cpu.io_ports[DRIVE_HEAD_REG] != 0xE0 )
@@ -267,7 +274,7 @@ void ATAPI_command(void) {
     } break;
     case 0xA0: {
       // PACKET
-      drive.buffer = drive.curr_byte = &packet;
+      drive.buffer = drive.curr_byte = &(drive.packet);
       drive.buffer_size = 12;
       drive.status &= ~0x80; // BSY
       drive.status |=  0x08; // DRQ
@@ -275,7 +282,7 @@ void ATAPI_command(void) {
     } break;
     case 0xEC: {
       // IDENTIFY
-      drive.buffer = drive.curr_byte = &drive_desc;
+      drive.buffer = drive.curr_byte = &(drive.drive_desc);
       drive.buffer_size = 512;
       drive.status &= ~0x80; // BSY
       drive.status |=  0x08; // DRQ
@@ -312,6 +319,7 @@ void ATAPI_send_bytes(void) {
 }
 
 void ATAPI_execute_packet(void) {
+  uint8_t* packet = &(drive.packet);
   switch( packet[0] ) {
     case 0x1B: {
       // START/STOP
@@ -707,17 +715,17 @@ void PIT_update_counter(void) {
 // ********* //
 
 void update_RTC(void) {
-  //time_t t = time(NULL);
-  //struct tm* date = localtime(&t);
+  time_t t = time(NULL);
+  struct tm* date = localtime(&t);
 
   switch( cpu.io_ports[0x70] ) {
-    case 0x00: cpu.io_ports[0x71] = 0; break;//date->tm_sec; break;
-    case 0x02: cpu.io_ports[0x71] = 0; break;//date->tm_min; break;
-    case 0x04: cpu.io_ports[0x71] = 0; break;//date->tm_hour; break;
-    case 0x06: cpu.io_ports[0x71] = 1; break;//date->tm_wday + 1; break;
-    case 0x07: cpu.io_ports[0x71] = 0; break;//date->tm_mday; break;
-    case 0x08: cpu.io_ports[0x71] = 1; break;//date->tm_mon + 1; break;
-    case 0x09: cpu.io_ports[0x71] = 0; break;//date->tm_year % 100; break;
+    case 0x00: cpu.io_ports[0x71] = /*0; break;*/date->tm_sec; break;
+    case 0x02: cpu.io_ports[0x71] = /*0; break;*/date->tm_min; break;
+    case 0x04: cpu.io_ports[0x71] = /*0; break;*/date->tm_hour; break;
+    case 0x06: cpu.io_ports[0x71] = /*1; break;*/date->tm_wday + 1; break;
+    case 0x07: cpu.io_ports[0x71] = /*0; break;*/date->tm_mday; break;
+    case 0x08: cpu.io_ports[0x71] = /*1; break;*/date->tm_mon + 1; break;
+    case 0x09: cpu.io_ports[0x71] = /*0; break;*/date->tm_year % 100; break;
     case 0x0A: cpu.io_ports[0x71] = 0; break;          // bit 7: is the RTC updating? Answer: never;
     case 0x0B: cpu.io_ports[0x71] = 0b00000110; break; // bit 1: 24 hour fmt; bit 2: ints, not BCD;
     default: panic("RTC can't interpret value in io port 0x70!");
