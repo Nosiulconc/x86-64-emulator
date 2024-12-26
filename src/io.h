@@ -21,6 +21,11 @@ extern pthread_mutex_t irq_queue_mutex;
 extern uint64_t read_unsigned(uint8_t*, uint8_t);
 extern void exe_push(uint8_t*, uint8_t);
 
+void IRQ(uint8_t line);
+
+int64_t mouse_x = 0, mouse_y = 0;
+int64_t mouse_anchor_x = 0, mouse_anchor_y = 0;
+
 // ********** //
 // ** PS/2 ** //
 // ********** //
@@ -181,7 +186,6 @@ void PS2_receive_bytes(void) {
         case 0xF3: {
           // SET TYPING RATE
 	  ps2.state = SET_TYPING_RATE;
-	  enqueue_output(0xFA);
 	  return;
         }
         default: panic("PS2 cannot process 0x%x commands from DATA!", cpu.io_ports[PS2_DATA]);
@@ -213,6 +217,120 @@ void PS2_receive_bytes(void) {
     }
     default: panic("unhandled case in PS2_receive_bytes!");
   }
+}
+
+static int32_t PS2_get_scancode(SDL_Event event) {
+  switch( event.key.keysym.scancode ) {
+    case SDL_SCANCODE_ESCAPE: return 0x01;
+    case SDL_SCANCODE_1: return 0x02;
+    case SDL_SCANCODE_2: return 0x03;
+    case SDL_SCANCODE_3: return 0x04;
+    case SDL_SCANCODE_4: return 0x05;
+    case SDL_SCANCODE_5: return 0x06;
+    case SDL_SCANCODE_6: return 0x07;
+    case SDL_SCANCODE_7: return 0x08;
+    case SDL_SCANCODE_8: return 0x09;
+    case SDL_SCANCODE_9: return 0x0A;
+    case SDL_SCANCODE_0: return 0x0B;
+    case SDL_SCANCODE_MINUS: return 0x0C;
+    case SDL_SCANCODE_EQUALS: return 0x0D;
+    case SDL_SCANCODE_BACKSPACE: return 0x0E;
+    case SDL_SCANCODE_TAB: return 0x0F;
+    case SDL_SCANCODE_Q: return 0x10;
+    case SDL_SCANCODE_W: return 0x11;
+    case SDL_SCANCODE_E: return 0x12;
+    case SDL_SCANCODE_R: return 0x13;
+    case SDL_SCANCODE_T: return 0x14;
+    case SDL_SCANCODE_Y: return 0x15;
+    case SDL_SCANCODE_U: return 0x16;
+    case SDL_SCANCODE_I: return 0x17;
+    case SDL_SCANCODE_O: return 0x18;
+    case SDL_SCANCODE_P: return 0x19;
+    case SDL_SCANCODE_LEFTBRACKET: return 0x1A;
+    case SDL_SCANCODE_RIGHTBRACKET: return 0x1B;
+    case SDL_SCANCODE_RETURN: return 0x1C;
+    case SDL_SCANCODE_LCTRL: case SDL_SCANCODE_RCTRL: return 0x1D;
+    case SDL_SCANCODE_A: return 0x1E;
+    case SDL_SCANCODE_S: return 0x1F;
+    case SDL_SCANCODE_D: return 0x20;
+    case SDL_SCANCODE_F: return 0x21;
+    case SDL_SCANCODE_G: return 0x22;
+    case SDL_SCANCODE_H: return 0x23;
+    case SDL_SCANCODE_J: return 0x24;
+    case SDL_SCANCODE_K: return 0x25;
+    case SDL_SCANCODE_L: return 0x26;
+    case SDL_SCANCODE_SEMICOLON: return 0x27;
+    case SDL_SCANCODE_APOSTROPHE: return 0x28;
+    case SDL_SCANCODE_LSHIFT: return 0x2A;
+    case SDL_SCANCODE_BACKSLASH: return 0x2B;
+    case SDL_SCANCODE_Z: return 0x2C;
+    case SDL_SCANCODE_X: return 0x2D;
+    case SDL_SCANCODE_C: return 0x2E;
+    case SDL_SCANCODE_V: return 0x2F;
+    case SDL_SCANCODE_B: return 0x30;
+    case SDL_SCANCODE_N: return 0x31;
+    case SDL_SCANCODE_M: return 0x32;
+    case SDL_SCANCODE_COMMA: return 0x33;
+    case SDL_SCANCODE_PERIOD: return 0x34;
+    case SDL_SCANCODE_SLASH: return 0x35;
+    case SDL_SCANCODE_RSHIFT: return 0x36;
+    case SDL_SCANCODE_LALT: case SDL_SCANCODE_RALT: return 0x38;
+    case SDL_SCANCODE_SPACE: return 0x39;
+    case SDL_SCANCODE_CAPSLOCK: return 0x3A;
+    case SDL_SCANCODE_F1: return 0x3B;
+    case SDL_SCANCODE_F2: return 0x3C;
+    case SDL_SCANCODE_F3: return 0x3D;
+    case SDL_SCANCODE_F4: return 0x3E;
+    case SDL_SCANCODE_F5: return 0x3F;
+    case SDL_SCANCODE_F6: return 0x40;
+    case SDL_SCANCODE_F7: return 0x41;
+    case SDL_SCANCODE_F8: return 0x42;
+    case SDL_SCANCODE_F9: return 0x43;
+    case SDL_SCANCODE_F10: return 0x44;
+    case SDL_SCANCODE_SCROLLLOCK: return 0x46;
+    case SDL_SCANCODE_HOME: return 0x47;
+    case SDL_SCANCODE_UP: return 0x48;
+    case SDL_SCANCODE_PAGEUP: return 0x49;
+    case SDL_SCANCODE_LEFT: return 0x4B;
+    case SDL_SCANCODE_RIGHT: return 0x4D;
+    case SDL_SCANCODE_END: return 0x4F;
+    case SDL_SCANCODE_DOWN: return 0x50;
+    case SDL_SCANCODE_PAGEDOWN: return 0x51;
+    case SDL_SCANCODE_INSERT: return 0x52;
+    case SDL_SCANCODE_F11: return 0x57;
+    case SDL_SCANCODE_F12: return 0x58;
+    default: panic("Unhandled scancode 0x%x!", event.key.keysym.scancode);
+  }
+}
+
+static void PS2_send_scancode(SDL_Event event) {
+  switch( event.key.keysym.scancode ) {
+    case SDL_SCANCODE_RALT: case SDL_SCANCODE_RCTRL: case SDL_SCANCODE_INSERT: case SDL_SCANCODE_DELETE: case SDL_SCANCODE_LEFT: case SDL_SCANCODE_HOME: case SDL_SCANCODE_END: case SDL_SCANCODE_UP: case SDL_SCANCODE_DOWN: case SDL_SCANCODE_PAGEUP: case SDL_SCANCODE_PAGEDOWN: case SDL_SCANCODE_RIGHT: {
+      enqueue_output(0xE0);
+    } break;
+    default:
+  }
+  
+  enqueue_output( event.type == SDL_KEYDOWN ? PS2_get_scancode(event) : PS2_get_scancode(event) | 0x80 );
+  IRQ(1);
+}
+
+static void PS2_send_mouse_pos(void) {
+  const int64_t x_pos = 10; //mouse_x - mouse_anchor_x;
+  const int64_t y_pos = 0;  //mouse_y - mouse_anchor_y;
+  //mouse_anchor_x = mouse_x;
+  //mouse_anchor_y = mouse_y;
+
+  if( x_pos == 0 && y_pos == 0 ) return;
+
+  uint8_t status = 0b00001000;
+  status |= (uint8_t)(x_pos < 0) << 4;
+  status |= (uint8_t)(y_pos < 0) << 5;
+  
+  enqueue_output(status);
+  enqueue_output(x_pos & 0xFF);
+  enqueue_output(y_pos & 0xFF);
+  //IRQ(12); // is not detected
 }
 
 // *********** //
@@ -425,7 +543,6 @@ void PIC_process_irqs(void) {
   if( line > 15 )
     panic("0 <= IRQ line <= 15 !");
 
-  //panic("INT!!");
   const uint8_t vector = line + (line <= 7 ? dual_pic.pic1.idt_index : dual_pic.pic2.idt_index);
   uint8_t* int_desc_addr = ram + cpu.idtr.base + 16*vector;
   const uint64_t int_desc_low  = read_unsigned(int_desc_addr, 8);
@@ -618,7 +735,7 @@ void PIT_override_mode(void) {
   if( ports.select_chan == 0b11 ) panic("PIT can't handle readback commands!");
   if( ports.access_mode == 0b00 ) return; // ignore latch commands
 
-  if( ports.select_chan != 0b00 ) panic("PIT channel 1 and 2 are not implemented!");
+  if( ports.select_chan != 0b00 ) return; //panic("PIT channel 1 and 2 are not implemented!");
   if( ports.op_mode != 2 ) panic("PIT mode 0, 1, 3, 4, 5 are not implemented!");
   if( ports.count_mode == 1 ) panic("PIT BCD counting is not implemented!");
   pit.chan0.access_mode = ports.access_mode;
@@ -627,7 +744,7 @@ void PIT_override_mode(void) {
 }
 
 void PIT_read_counter(uint16_t port) {
-  if( port != 0x40 ) panic("PIT Can't read channel 1 and 2 counters!");
+  if( port != 0x40 ) return; //panic("PIT Can't read channel 1 and 2 counters!");
 
   switch( pit.chan0.access_mode ) {
     case LOWBYTE_ONLY: {
@@ -655,7 +772,7 @@ void PIT_read_counter(uint16_t port) {
 }
 
 void PIT_write_reload_value(uint16_t port) {
-  if( port != 0x40 ) panic("PIT Can't write to channel 1 and 2 counters!");
+  if( port != 0x40 ) return; //panic("PIT Can't write to channel 1 and 2 counters!");
 
   switch( pit.chan0.access_mode ) {
     case LOWBYTE_ONLY: {
@@ -736,7 +853,7 @@ void update_RTC(void) {
 // ** VGA ** //
 // ********* //
 
-typedef enum { VGA_READ_RED, VGA_READ_GREEN, VGA_READ_BLUE } DAC_State;
+typedef enum { VGA_READ_RED, VGA_READ_GREEN, VGA_READ_BLUE, VGA_WRITE_RED, VGA_WRITE_GREEN, VGA_WRITE_BLUE } DAC_State;
 typedef enum { VGA_READ_INDEX, VGA_WRITE_COLOR_PALETTE, VGA_WRITE_HORIZONTAL_PIXEL_PANNING } AttributeReg_State;
 
 typedef struct {
@@ -811,6 +928,11 @@ static void VGA_get_palette_index(void) {
   vga.dac_state = VGA_READ_RED;
 }
 
+static void VGA_get_palette_index2(void) {
+  vga.color_index = cpu.io_ports[0x3C7];
+  vga.dac_state = VGA_WRITE_RED;
+}
+
 static void VGA_receive_color_bytes(void) {
   switch( vga.dac_state ) {
     case VGA_READ_RED: {
@@ -826,7 +948,26 @@ static void VGA_receive_color_bytes(void) {
       vga.dac_state = VGA_READ_RED;
       vga.color_index = (vga.color_index + 1) % 16;
     } break;
-    default:
+    default: panic("VGA unhandled case in receive_color_bytes!");
+  }
+}
+
+static void VGA_send_color_bytes(void) {
+  switch( vga.dac_state ) {
+    case VGA_WRITE_RED: {
+      cpu.io_ports[0x3C9] = vga.palette[vga.color_index].r*63/255;
+      vga.dac_state = VGA_WRITE_GREEN;
+    } break;
+    case VGA_WRITE_GREEN: {
+      cpu.io_ports[0x3C9] = vga.palette[vga.color_index].g*63/255;
+      vga.dac_state = VGA_WRITE_BLUE;
+    } break;
+    case VGA_WRITE_BLUE: {
+      cpu.io_ports[0x3C9] = vga.palette[vga.color_index].b*63/255;
+      vga.dac_state = VGA_WRITE_RED;
+      vga.color_index = (vga.color_index + 1) % 16;
+    } break;
+    default: panic("VGA unhandled case in send_color_bytes!");
   }
 }
 
@@ -865,16 +1006,127 @@ void* io_thread(void* arg) {
   SDL_Window* window = NULL;
   SDL_Renderer* renderer = NULL;
 
-  SDL_Init(SDL_INIT_VIDEO);
+  SDL_Init(SDL_INIT_EVERYTHING);
   SDL_CreateWindowAndRenderer(640, 480, 0, &window, &renderer);
 
   SDL_Event event;
   uint8_t running = 1;
+  uint8_t frame_count = 0;
+  uint8_t yolo = 1, yolo2 = 1, yolo3 = 1;
+
+  mouse_anchor_x = mouse_x;
+  mouse_anchor_y = mouse_y;
 
   while( running ) {
-    while( SDL_PollEvent( &event ) != 0 ) {
+    while( SDL_PollEvent(&event) != 0 ) {
       if( event.type == SDL_QUIT ) {
         running = 0;
+      }
+
+      if( event.type == SDL_MOUSEMOTION ) {
+        SDL_GetMouseState(&mouse_x, &mouse_y);
+      }
+
+      if( event.type == SDL_KEYDOWN || event.type == SDL_KEYUP ) {
+	if( event.key.keysym.sym == 'a' && yolo ) {
+          /* C */ enqueue_output(0x2A); enqueue_output(0x2E); enqueue_output(0xAE); enqueue_output(0xAA);
+	  /* d */ enqueue_output(0x20); enqueue_output(0xA0);
+          /* ( */ enqueue_output(0x2A); enqueue_output(0x0A); enqueue_output(0x8A); enqueue_output(0xAA);
+	  /* " */ enqueue_output(0x2A); enqueue_output(0x28); enqueue_output(0xA8); enqueue_output(0xAA);
+          /* : */ enqueue_output(0x2A); enqueue_output(0x27); enqueue_output(0xA7); enqueue_output(0xAA);
+          /* : */ enqueue_output(0x2A); enqueue_output(0x27); enqueue_output(0xA7); enqueue_output(0xAA);
+          /* / */ enqueue_output(0x35); enqueue_output(0xB5);
+          /* D */ enqueue_output(0x2A); enqueue_output(0x20); enqueue_output(0xA0); enqueue_output(0xAA);
+          /* e */ enqueue_output(0x12); enqueue_output(0x92);
+          /* m */ enqueue_output(0x32); enqueue_output(0xB2);
+          /* o */ enqueue_output(0x18); enqueue_output(0x98);
+          /* / */ enqueue_output(0x35); enqueue_output(0xB5);
+	  for(int i = 0; i < 36; ++i) IRQ(1);
+	  yolo = 0;
+	} else if( event.key.keysym.sym == 'b' && yolo2 ) {
+          /* # */ enqueue_output(0x2A); enqueue_output(0x04); enqueue_output(0x84); enqueue_output(0xAA);
+          /* i */ enqueue_output(0x17); enqueue_output(0x97);
+          /* n */ enqueue_output(0x31); enqueue_output(0xB1);
+          /* c */ enqueue_output(0x2E); enqueue_output(0xAE);
+          /* l */ enqueue_output(0x26); enqueue_output(0xA6);
+          /* u */ enqueue_output(0x16); enqueue_output(0x96);
+          /* d */ enqueue_output(0x20); enqueue_output(0xA0);
+          /* e */ enqueue_output(0x12); enqueue_output(0x92);
+          /*   */ enqueue_output(0x39); enqueue_output(0xB9);
+          /* " */ enqueue_output(0x2A); enqueue_output(0x28); enqueue_output(0xA8); enqueue_output(0xAA);
+          
+	  ///* M */ enqueue_output(0x2A); enqueue_output(0x32); enqueue_output(0xB2); enqueue_output(0xAA);
+	  ///* i */ enqueue_output(0x17); enqueue_output(0x97);
+	  ///* n */ enqueue_output(0x31); enqueue_output(0xB1);
+	  ///* i */ enqueue_output(0x17); enqueue_output(0x97);
+	  ///* C */ enqueue_output(0x2A); enqueue_output(0x2E); enqueue_output(0xAE); enqueue_output(0xAA);
+	  ///* o */ enqueue_output(0x18); enqueue_output(0x98);
+	  ///* m */ enqueue_output(0x32); enqueue_output(0xB2);
+	  ///* p */ enqueue_output(0x19); enqueue_output(0x99);
+	  ///* i */ enqueue_output(0x17); enqueue_output(0x97);
+	  ///* l */ enqueue_output(0x26); enqueue_output(0xA6);
+	  ///* e */ enqueue_output(0x12); enqueue_output(0x92);
+	  ///* r */ enqueue_output(0x13); enqueue_output(0x93);
+
+          /* Z */ enqueue_output(0x2A); enqueue_output(0x2C); enqueue_output(0xAC); enqueue_output(0xAA);
+	  /* o */ enqueue_output(0x18); enqueue_output(0x98);
+	  /* n */ enqueue_output(0x31); enqueue_output(0xB1);
+	  /* e */ enqueue_output(0x12); enqueue_output(0x92);
+	  /* O */ enqueue_output(0x2A); enqueue_output(0x18); enqueue_output(0x98); enqueue_output(0xAA);
+	  /* u */ enqueue_output(0x16); enqueue_output(0x96);
+	  /* t */ enqueue_output(0x14); enqueue_output(0x94);
+
+          ///* D */ enqueue_output(0x2A); enqueue_output(0x20); enqueue_output(0xA0); enqueue_output(0xAA);
+	  ///* u */ enqueue_output(0x16); enqueue_output(0x96);
+	  ///* n */ enqueue_output(0x31); enqueue_output(0xB1);
+	  ///* G */ enqueue_output(0x2A); enqueue_output(0x22); enqueue_output(0xA2); enqueue_output(0xAA);
+	  ///* e */ enqueue_output(0x12); enqueue_output(0x92);
+	  ///* n */ enqueue_output(0x31); enqueue_output(0xB1);
+
+	  ///* V */ enqueue_output(0x2A); enqueue_output(0x2F); enqueue_output(0xAF); enqueue_output(0xAA);
+          ///* a */ enqueue_output(0x1E); enqueue_output(0x9E);
+          ///* r */ enqueue_output(0x13); enqueue_output(0x93);
+          ///* o */ enqueue_output(0x18); enqueue_output(0x98);
+          ///* o */ enqueue_output(0x18); enqueue_output(0x98);
+          ///* m */ enqueue_output(0x32); enqueue_output(0xB2);
+
+	  ///* R */ enqueue_output(0x2A); enqueue_output(0x13); enqueue_output(0x93); enqueue_output(0xAA);
+	  ///* o */ enqueue_output(0x18); enqueue_output(0x98);
+	  ///* c */ enqueue_output(0x2E); enqueue_output(0xAE);
+	  ///* k */ enqueue_output(0x25); enqueue_output(0xA5);
+	  ///* e */ enqueue_output(0x12); enqueue_output(0x92);
+	  ///* t */ enqueue_output(0x14); enqueue_output(0x94);
+          
+	  /* " */ enqueue_output(0x2A); enqueue_output(0x28); enqueue_output(0xA8); enqueue_output(0xAA);
+          /* ; */ enqueue_output(0x27); enqueue_output(0xA7);
+	  for(int i = 0; i < 44 + 14 - 12 + 2; ++i) IRQ(1);
+	  yolo2 = 0;
+	} else if( event.key.keysym.sym == 'c' && yolo3 ) {
+	  ///* L */ enqueue_output(0x2A); enqueue_output(0x26); enqueue_output(0xA6); enqueue_output(0xAA);
+	  ///* e */ enqueue_output(0x12); enqueue_output(0x92);
+	  ///* c */ enqueue_output(0x2E); enqueue_output(0xAE);
+	  ///* t */ enqueue_output(0x14); enqueue_output(0x94);
+	  ///* u */ enqueue_output(0x16); enqueue_output(0x96);
+	  ///* r */ enqueue_output(0x13); enqueue_output(0x93);
+	  ///* e */ enqueue_output(0x12); enqueue_output(0x92);
+	  ///* s */ enqueue_output(0x1F); enqueue_output(0x9F);
+          
+	  /* G */ enqueue_output(0x2A); enqueue_output(0x22); enqueue_output(0xA2); enqueue_output(0xAA);
+          /* a */ enqueue_output(0x1E); enqueue_output(0x9E);
+          /* m */ enqueue_output(0x32); enqueue_output(0xB2);
+          /* e */ enqueue_output(0x12); enqueue_output(0x92);
+          /* s */ enqueue_output(0x1F); enqueue_output(0x9F);
+          
+	  /* " */ enqueue_output(0x2A); enqueue_output(0x28); enqueue_output(0xA8); enqueue_output(0xAA);
+          /* ) */ enqueue_output(0x2A); enqueue_output(0x0B); enqueue_output(0x8B); enqueue_output(0xAA);
+          /* ; */ enqueue_output(0x27); enqueue_output(0xA7);
+	  for(int i = 0; i < 28 - 6; ++i) IRQ(1);
+	  yolo3 = 0;
+	} else if( event.key.keysym.sym == 'd' ) {
+	  PS2_send_mouse_pos();
+	} else {
+	  PS2_send_scancode(event);
+	}
       }
     }
 
@@ -882,6 +1134,11 @@ void* io_thread(void* arg) {
     VGA_render_vram(renderer);
     SDL_RenderPresent(renderer);
 
+    if( frame_count % 30 == 0 ) {
+      //PS2_send_mouse_pos();
+    }
+
+    ++frame_count;
     SDL_Delay(33);
   }
 

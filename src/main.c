@@ -241,7 +241,7 @@ static void print_stack_trace(void) {
 
 static void tick(void) {
   decode_instruction(assembly);
-  //if( cpu.rip == 0xE071 )
+  //if( cpu.rip == 0x1B7A3 )
   //  panic("found!");
   PIT_update_counter();
   PIC_process_irqs();

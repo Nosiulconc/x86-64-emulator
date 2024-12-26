@@ -13,6 +13,8 @@
 #define ABS(x) ((x) < 0) ? -(x) : (x)
 #define MIN(x, y) ((x) < (y)) ? (x) : (y)
 
+#define PI 3.14159265358979323846L
+
 #define SET_FLAG(flag)   cpu.rflags |= flag
 #define CLEAR_FLAG(flag) cpu.rflags &= ~(flag)
 #define UPDATE_FLAG(expr, flag) if( expr ) { SET_FLAG(flag); } else { CLEAR_FLAG(flag); }
@@ -1016,6 +1018,38 @@ static void exe_scas(uint8_t operand_sz, uint8_t addr_sz) {
   }
 }
 
+static void exe_cmps(uint8_t operand_sz, uint8_t addr_sz) {
+  const SegmentRegister segment = overridable_segment(DS);
+
+  const uint64_t src_offset  = read_unsigned(get_reg_addr(RSI, addr_sz), addr_sz);
+  const uint64_t dest_offset = read_unsigned(get_reg_addr(RDI, addr_sz), addr_sz);
+  uint8_t* src_addr  = ram + get_flat_address(segment, src_offset);
+  uint8_t* dest_addr = ram + get_flat_address(ES, dest_offset);
+  const int8_t dir   = GET_RFLAGS(RFLAGS_DF) ? -operand_sz : operand_sz;
+
+  if( prefixes.g1.present && prefixes.g1.prefix == 0xF3 ) {
+    while( 1 ) {
+      const uint64_t cx = read_unsigned(get_reg_addr(RCX, addr_sz), addr_sz);
+      if( cx == 0 ) break;
+
+      const int64_t a = read_signed(src_addr, operand_sz);
+      const int64_t b = read_signed(dest_addr, operand_sz);
+      exe_cmp(a, b);
+      cpu.rsi += dir; cpu.rdi += dir;
+      src_addr += dir; dest_addr += dir;
+
+      if( GET_RFLAGS(RFLAGS_ZF) == 0 ) break;
+      --(cpu.rcx);
+    }
+  }
+  else {
+    const int64_t a = read_signed(src_addr, operand_sz);
+    const int64_t b = read_signed(dest_addr, operand_sz);
+    exe_cmp(a, b);
+    cpu.rsi += dir; cpu.rdi += dir;
+  }
+}
+
 static void exe_sar(uint8_t* dest_addr, uint8_t dest_sz, uint64_t a, uint64_t b) {
   uint64_t c = a;
   const uint64_t sign = a & ((uint64_t)1 << (dest_sz*8 - 1));
@@ -1332,6 +1366,7 @@ static void exe_in(uint8_t* dest_addr, uint8_t dest_sz, uint16_t port) {
       case 0x1F5:
       case 0x1F6: break;
       case 0x1F7: ATAPI_send_status(); break;
+      case 0x3C9: VGA_send_color_bytes(); break;
       case 0x3DA: VGA_reset_attribute_register(); break;
       default: panic("IN from unknown port 0x%x!", port);
     }
@@ -1406,6 +1441,7 @@ static void exe_out(uint8_t* src_addr, uint8_t src_sz, uint16_t port) {
         break;
       }
       case 0x3C6: break; // update bit mask register
+      case 0x3C7: VGA_get_palette_index2(); break;
       case 0x3C8: VGA_get_palette_index(); break;
       case 0x3C9: VGA_receive_color_bytes(); break;
       default: panic("OUT to unknown port 0x%x!", port);
@@ -1561,14 +1597,48 @@ static void exe_faddp(void) {
   pop_fpu();
 }
 
+static void exe_fdivp(void) {
+  if( val_st(0) == 0 ) panic("FDIVP cannot divide by zero!");
+  store_fpu_st(1, val_st(1) / val_st(0));
+  pop_fpu();
+}
+
 static void exe_fsubrp(void) {
   store_fpu_st(1, val_st(0) - val_st(1));
   pop_fpu();
 }
 
+static void exe_fdivrp(void) {
+  if( val_st(1) == 0 ) panic("FDIVRP cannot divide by zero!");
+  store_fpu_st(1, val_st(0) / val_st(1));
+  pop_fpu();
+}
+
 static void exe_fsqrt(void) {
-  if( val_st(0) < 0 ) panic("FSQRT cannot take the root of negative numbers!");
-  store_fpu_st(0, sqrtl(val_st(0)));
+  //if( val_st(0) < 0 ) panic("FSQRT cannot take the root of %Lf !", val_st(0));
+  store_fpu_st(0, sqrtl( val_st(0) < 0 ? -val_st(0) : val_st(0) ));
+}
+
+static void exe_fcos(void) {
+  store_fpu_st(0, cosl(val_st(0)));
+}
+
+static void exe_fsin(void) {
+  store_fpu_st(0, sinl(val_st(0)));
+}
+
+static void exe_fpatan(void) {
+  store_fpu_st(1, atan2l( val_st(1), val_st(0) ));
+  pop_fpu();
+}
+
+static void exe_fabs(void) {
+  const f80_t st0 = val_st(0);
+  store_fpu_st(0, st0 < 0 ? -st0 : st0 );
+}
+
+static void exe_fprem(void) {
+  store_fpu_st(0, fmodl(val_st(0), val_st(1)));
 }
 
 static uint8_t get_fpu_control_rc(void) {
@@ -1579,8 +1649,8 @@ static void exe_frndint(void) {
   f80_t rnd_st0;
   switch( get_fpu_control_rc() ) {
     case 0b00: rnd_st0 = roundl(val_st(0)); break;
-    case 0b01:
-    case 0b10: panic("Invalid FPU rounding mode!");
+    case 0b01: rnd_st0 = floorl(val_st(0)); break;
+    case 0b10: rnd_st0 = ceill(val_st(0)); break;
     case 0b11: rnd_st0 = truncl(val_st(0)); break;
   }
   store_fpu_st(0, rnd_st0);
@@ -1591,7 +1661,7 @@ static void exe_f2xm1(void) {
 }
 
 static void exe_fyl2x(void) {
-  if( val_st(0) <= 0 ) panic("FYL2X cannot take the log2 of ST(0) <= 0 !");
+  if( val_st(0) < 0 ) panic("FYL2X cannot take the log2 of %Lf <= 0 with ST(1) = %Lf !", val_st(0), val_st(1));
   store_fpu_st(1, val_st(1) * log2l(val_st(0)));
   pop_fpu();
 }
@@ -2337,6 +2407,21 @@ static void decode_one_byte_opcode(String assembly) {
       exe_movs(operand_sz, addr_sz);
       return;
     }
+    case 0xA6:
+    case 0xA7: {
+      const uint8_t w = (*opcode >> 0) & 0x1;
+      const uint8_t operand_sz = w ? rex_ext_operand_sz() : 1;
+      const uint8_t addr_sz = address_sz();
+
+      snprintf(str, len, "%sCMPS%c  es:[%s], %s:[%s]", rep_prefix_str(),
+                                                       get_str_inst_letter(operand_sz),
+                                                       get_reg_str(RDI, addr_sz),
+                                                       overridable_segment_str(DS),
+                                                       get_reg_str(RSI, addr_sz));
+      ++(cpu.rip);
+      exe_cmps(operand_sz, addr_sz);
+      return;
+    }
     case 0xA8:
     case 0xA9: {
       const uint8_t w = (*opcode >> 0) & 0x1;
@@ -2591,12 +2676,63 @@ static void decode_one_byte_opcode(String assembly) {
       exe_xlat(addr);
       return;
     }
+    case 0xD8: {
+      switch( *(opcode+1) ) {
+        case 0xC8:
+        case 0xC9:
+        case 0xCA:
+        case 0xCB:
+        case 0xCC:
+        case 0xCD:
+        case 0xCE:
+        case 0xCF: {
+          const int8_t disp = *(opcode+1) - 0xC8;
+          cpu.rip += 2;
+
+          snprintf(str, len, "FMUL  st(0), st(%d)", disp);
+          exe_fmul(val_st(disp));
+          return;
+        }
+        default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xD8 not implemented!");
+      }
+
+      /*
+      const uint8_t operand_sz = fpu_operand_sz();
+      MODRM(modrm_addr, 0);
+      
+      switch( info.ext_opcode ) {
+        default:
+      }
+      */
+      panic("Subop (2) of 0xD8 not implemented!");
+    }
     case 0xD9: {
       switch( *(opcode+1) ) {
+        case 0xC0:
+        case 0xC1:
+        case 0xC2:
+        case 0xC3:
+        case 0xC4:
+        case 0xC5:
+        case 0xC6:
+        case 0xC7: {
+          const int8_t disp = *(opcode+1) & 0b111;
+          cpu.rip += 2;
+
+          snprintf(str, len, "FLD  st(%d)", disp);
+          exe_load_fpu(val_st(disp));
+          return;
+        }
         case 0xE0: {
           cpu.rip += 2;
           snprintf(str, len, "FCHS");
           exe_fmul(-1);
+          return;
+        }
+        case 0xE1: {
+          cpu.rip += 2;
+          snprintf(str, len, "FABS");
+          exe_fabs();
           return;
         }
         case 0xE8: {
@@ -2615,6 +2751,12 @@ static void decode_one_byte_opcode(String assembly) {
           cpu.rip += 2;
           snprintf(str, len, "FLDL2E");
           exe_load_fpu( log2l(expl(1)) );
+          return;
+        }
+        case 0xEB: {
+          cpu.rip += 2;
+          snprintf(str, len, "FLDPI");
+          exe_load_fpu(PI);
           return;
         }
         case 0xEC: {
@@ -2641,10 +2783,22 @@ static void decode_one_byte_opcode(String assembly) {
           exe_fyl2x();
           return;
         }
+        case 0xF3: {
+          cpu.rip += 2;
+          snprintf(str, len, "FPATAN");
+          exe_fpatan();
+          return;
+        }
         case 0xF7: {
           cpu.rip += 2;
           snprintf(str, len, "FINCSTP");
           exe_fincstp();
+          return;
+        }
+        case 0xF8: {
+          cpu.rip += 2;
+          snprintf(str, len, "FPREM");
+          exe_fprem();
           return;
         }
         case 0xFA: {
@@ -2663,6 +2817,18 @@ static void decode_one_byte_opcode(String assembly) {
           cpu.rip += 2;
           snprintf(str, len, "FSCALE");
           exe_fscale();
+          return;
+        }
+        case 0xFE: {
+          cpu.rip += 2;
+          snprintf(str, len, "FSIN");
+          exe_fsin();
+          return;
+        }
+        case 0xFF: {
+          cpu.rip += 2;
+          snprintf(str, len, "FCOS");
+          exe_fcos();
           return;
         }
         default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xD9 not implemented!");
@@ -2753,7 +2919,7 @@ static void decode_one_byte_opcode(String assembly) {
           exe_ffree( *(opcode+1) & 0b111 );
           return;
         }
-		default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xDD not implemented!");
+	default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xDD not implemented!");
       }
 
       const uint8_t operand_sz = fpu_operand_sz();
@@ -2809,11 +2975,29 @@ static void decode_one_byte_opcode(String assembly) {
           exe_fsubrp();
           return;
         }
+        case 0xF1: {
+          cpu.rip += 2;
+          snprintf(str, len, "FDIVRP");
+          exe_fdivrp();
+          return;
+        }
+        case 0xF9: {
+          cpu.rip += 2;
+          snprintf(str, len, "FDIVP");
+          exe_fdivp();
+          return;
+        }
       }
       panic("Subop of 0xDE not implemented!");
     }
     case 0xDF: {
       switch( *(opcode+1) ) {
+	case 0xE0: {
+          cpu.rip += 2;
+          snprintf(str, len, "FNSTSW  ax");
+          exe_mov(&(cpu.ax), &(fpu.status), 2);
+          return;
+	}
         case 0xF0:
         case 0xF1:
         case 0xF2:
@@ -2829,7 +3013,7 @@ static void decode_one_byte_opcode(String assembly) {
           exe_fcomip(disp);
           return;
         }
-		default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xDF not implemented!");
+	default: if( *(opcode+1) > 0xBF ) panic("Subop (1) of 0xDF not implemented!");
       }
 
       switch( get_ext_opcode_in_modrm(opcode+1) ) {
